@@ -11,6 +11,8 @@ const PORT = Number(process.env.PORT) || 8123
 
 // 方法集合自动落盘目录：dist-offline/methods/nxtheme-methods.json
 const METHODS_FILE = join(root, "methods", "nxtheme-methods.json")
+// 用户自定义标注配置文件：dist-offline/applets/dll/pane-labels.json（构建不会覆盖该文件，可跨构建保留）
+const PANE_LABELS_FILE = join(root, "applets", "dll", "pane-labels.json")
 
 const MIME = {
     ".html": "text/html; charset=utf-8",
@@ -33,6 +35,8 @@ const readBody = (req) => new Promise((resolve, reject) => {
 
 const server = createServer(async (req, res) => {
     try {
+        // 禁止缓存，确保刷新总是拿到最新构建（避免旧页面/旧 JS）
+        res.setHeader("Cache-Control", "no-store")
         const pathname = decodeURIComponent(new URL(req.url, "http://localhost").pathname)
         // 方法集合的读写：保存方法时自动写入本机文件夹，下次打开直接读取
         if (pathname === "/api/methods") {
@@ -47,6 +51,29 @@ const server = createServer(async (req, res) => {
             }
             if (req.method === "GET") {
                 const data = await readFile(METHODS_FILE)
+                res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" })
+                res.end(data)
+                return
+            }
+        }
+        // 用户自定义标注的读写
+        if (pathname === "/api/pane-labels") {
+            if (req.method === "POST") {
+                const body = await readBody(req)
+                const { labels } = JSON.parse(body.toString("utf8"))
+                await mkdir(dirname(PANE_LABELS_FILE), { recursive: true })
+                await writeFile(PANE_LABELS_FILE, JSON.stringify({ labels: labels ?? {} }, null, 2))
+                res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" })
+                res.end('{"ok":true}')
+                return
+            }
+            if (req.method === "GET") {
+                let data = "{}"
+                try {
+                    data = await readFile(PANE_LABELS_FILE, "utf8")
+                } catch {
+                    // 文件不存在时返回空对象
+                }
                 res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" })
                 res.end(data)
                 return
