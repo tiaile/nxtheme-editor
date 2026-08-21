@@ -92,6 +92,18 @@ if (css) {
 // 7) 修正 runtime baseURL 为相对路径（file:// 下图标等资源按相对路径解析）
 html = html.replaceAll('baseURL:"/"', 'baseURL:"./"')
 
+// 7.5) 内联标注数据 applets/dll/pane-labels.json。
+//      file:// 协议下浏览器禁止 fetch() 本地文件，直接双击 index.html 时无法加载该 JSON，
+//      因此把内容以 <script type="application/json"> 注入 HTML，前端优先读取内联数据兜底。
+const labelsFile = join(outDir, "applets", "dll", "pane-labels.json")
+if (existsSync(labelsFile)) {
+    const labelsJson = readFileSync(labelsFile, "utf8")
+        .replace(/<\/script/gi, "<\\/script") // 防御 </script> 提前闭合
+    html = html.replace("</head>", () =>
+        `<script type="application/json" id="pane-labels-data">${labelsJson}</script>\n</head>`,
+    )
+}
+
 // 写出
 mkdirSync(outDir, { recursive: true })
 writeFileSync(join(outDir, "index.html"), html)

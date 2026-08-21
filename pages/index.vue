@@ -1232,18 +1232,32 @@ const persistPaneLabels = async (): Promise<boolean> => {
     }
 }
 
-// 启动时从服务端配置文件加载（若有），与本地已存合并
+// 启动时加载标注：优先读取构建时内联在 HTML 里的标注数据（file:// 双击打开也能用），
+// 再回退到同目录静态文件 / 预览服务 /api/pane-labels，最后与 localStorage 已有数据合并。
 const initPaneLabels = async () => {
+    const apply = (data: unknown) => {
+        if (data && typeof (data as { labels?: unknown }).labels === "object") {
+            paneLabels.value = { ...paneLabels.value, ...((data as { labels: Record<string, string> }).labels) }
+        }
+    }
+    // 1) 构建内联数据（脚本标签，file:// 与 http 均可用）
+    const el = document.getElementById("pane-labels-data")
+    if (el?.textContent) {
+        try { apply(JSON.parse(el.textContent)) } catch { /* 内容非法则忽略 */ }
+    }
+    try {
+        // 2) 同目录静态文件（任意静态托管可用；存在时以最新文件为准）
+        const r = await fetch("./applets/dll/pane-labels.json", { cache: "no-store" })
+        if (r.ok) apply(await r.json())
+        return
+    } catch {
+        // 3) 离线（file://）下 fetch 本地文件被浏览器拦截，回退到预览服务 API
+    }
     try {
         const r = await fetch("/api/pane-labels")
-        if (r.ok) {
-            const data = await r.json()
-            if (data && typeof data.labels === "object") {
-                paneLabels.value = { ...paneLabels.value, ...(data.labels as Record<string, string>) }
-            }
-        }
+        if (r.ok) apply(await r.json())
     } catch {
-        // 离线模式无 API，使用 localStorage 已有数据
+        // 完全离线：仅用内联数据 + localStorage
     }
 }
 
