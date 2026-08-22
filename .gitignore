@@ -8,6 +8,9 @@ dist
 # 离线成品（构建产物 + 本地生成的 out/ 等，不同步到 GitHub）
 dist-offline
 
+# 本地解析抽离的原始系统数据缓存（不同步到 GitHub）
+systemData/
+
 # Node dependencies
 node_modules
 
