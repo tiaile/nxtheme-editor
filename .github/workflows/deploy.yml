@@ -35,7 +35,8 @@ jobs:
             ${{ runner.os }}-${{ runner.arch }}-bun-canary-
 
       - name: Install dependencies
-        run: bun install --frozen-lockfile
+        # 仓库未提交 bun.lock，--frozen-lockfile 会因找不到锁文件而失败，故不加该标志
+        run: bun install
 
       - name: Generate static site
         run: NUXT_APP_BASE_URL=/${{ github.event.repository.name }}/ bun run build:generate
