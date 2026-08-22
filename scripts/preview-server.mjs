@@ -9,10 +9,12 @@ import { exec } from "node:child_process"
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..", "dist-offline")
 const PORT = Number(process.env.PORT) || 8123
 
-// 方法集合自动落盘目录：dist-offline/methods/nxtheme-methods.json
-const METHODS_FILE = join(root, "methods", "nxtheme-methods.json")
+// 方法集合自动落盘目录：dist-offline/applets/dll/nxtheme-methods.json
+const METHODS_FILE = join(root, "applets", "dll", "nxtheme-methods.json")
 // 用户自定义标注配置文件：dist-offline/applets/dll/pane-labels.json（构建不会覆盖该文件，可跨构建保留）
 const PANE_LABELS_FILE = join(root, "applets", "dll", "pane-labels.json")
+// 官方默认值配置文件：dist-offline/applets/dll/defaults.json（构建时也内联进 index.html，可在 localhost 下自行改）
+const DEFAULTS_FILE = join(root, "applets", "dll", "defaults.json")
 
 const MIME = {
     ".html": "text/html; charset=utf-8",
@@ -71,6 +73,29 @@ const server = createServer(async (req, res) => {
                 let data = "{}"
                 try {
                     data = await readFile(PANE_LABELS_FILE, "utf8")
+                } catch {
+                    // 文件不存在时返回空对象
+                }
+                res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" })
+                res.end(data)
+                return
+            }
+        }
+        // 官方默认值配置的读写（localhost 下可自行修改，用于「默认」按钮还原）
+        if (pathname === "/api/defaults") {
+            if (req.method === "POST") {
+                const body = await readBody(req)
+                JSON.parse(body.toString("utf8")) // 校验是合法 JSON
+                await mkdir(dirname(DEFAULTS_FILE), { recursive: true })
+                await writeFile(DEFAULTS_FILE, body)
+                res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" })
+                res.end('{"ok":true}')
+                return
+            }
+            if (req.method === "GET") {
+                let data = "{}"
+                try {
+                    data = await readFile(DEFAULTS_FILE, "utf8")
                 } catch {
                     // 文件不存在时返回空对象
                 }

@@ -507,6 +507,10 @@ const onImportSelected = async (event: Event) => {
     error.value = ""
 
     try {
+        // 清空上一份导入的图标预览，避免二次导入不含某图标时残留
+        for (const key of Object.keys(previewUrls.value) as NxthemeAssetKey[]) {
+            clearPreview(key)
+        }
         const result = await importNxtheme(file, form.value)
         form.value = result.nextForm
         for (const key of Object.keys(result.nextForm.assets) as NxthemeAssetKey[]) {
@@ -782,12 +786,17 @@ type LayoutEntryNode = {
     hasRadius: boolean // patch：是否存在 S_RoundRadius（圆角）UsdPatch
     radiusRef: string[] | null // patch：S_RoundRadius UsdPatch 的 PropValues 数组引用（单值）
     radius: number // 圆角半径值
+    usdColors: { name: string; vals: string[] }[] // patch：除 C_W / S_RoundRadius 外的 4 值 RGBA 颜色 UsdPatch（如 C_B、S_BorderColor0、S_DropShadowColor）
+    usdNums: { name: string; vals: string[] }[] // patch：除 C_W / S_RoundRadius 外的单值数值 UsdPatch（如 S_BorderSize、S_DropShadowSize、C_Id）
     ref: Record<string, unknown> // 指向 layoutJson 中对应的原始对象，用于回写
     posRef: Record<string, unknown> | null // patch 格式的 Position 对象
     scaleRef: Record<string, unknown> | null // patch 格式的 Scale 对象
     fileIdx?: number // patch：在 Files 数组中的下标（定位 layout.json 行用）
     patchIdx?: number // patch：在该文件 Patches 数组中的下标（定位 layout.json 行用）
     fileName?: string // patch：完整文件路径（如 blyt/RdtBase.bflyt，定位用）
+    entryKind?: string // entry：所属数组名（AddGroups / RemoveGroups / Materials）
+    entryIdx?: number // entry：在该数组中的下标
+    entryKey?: string // entry：文件对象上的数组字段名（等同 entryKind）
 }
 
 const layoutNodes = ref<LayoutEntryNode[]>([])
@@ -861,10 +870,10 @@ const collectLayoutNodes = (root: unknown): LayoutEntryNode[] => {
             for (const item of value) {
                 if (!item || typeof item !== "object") continue
                 const obj = item as Record<string, unknown>
-                if (typeof obj.FileName === "string" && Array.isArray(obj.Patches)) {
+                if (typeof obj.FileName === "string" && (Array.isArray(obj.Patches) || Array.isArray(obj.AddGroups) || Array.isArray(obj.RemoveGroups) || Array.isArray(obj.Materials))) {
                     const fileBase = (obj.FileName as string).split("/").pop() ?? ""
                     const fileIdx = patchFileCounter++
-                    for (const [patchIdx, patch] of (obj.Patches as unknown[]).entries()) {
+                    for (const [patchIdx, patch] of (obj.Patches as unknown[] ?? []).entries()) {
                         if (!patch || typeof patch !== "object") continue
                         const p = patch as Record<string, unknown>
                         const paneName = typeof p.PaneName === "string" ? p.PaneName : `补丁 #${nodes.length + 1}`
@@ -891,15 +900,22 @@ const collectLayoutNodes = (root: unknown): LayoutEntryNode[] => {
                         const rawX = hasX ? Number(pos.X) : 0
                         const rawY = hasY ? Number(pos.Y) : 0
                         // C_W / S_RoundRadius UsdPatch：C_W 为颜色+透明度([R,G,B,A])；S_RoundRadius 为圆角单值([v])
+                        // 其余 UsdPatch 分类收集：4 值 → 颜色（RGBA），单值 → 数值（窗格样式/ID 等）
                         let cwVals: string[] | null = null
                         let radiusVals: string[] | null = null
+                        const usdColors: { name: string; vals: string[] }[] = []
+                        const usdNums: { name: string; vals: string[] }[] = []
                         if (Array.isArray(p.UsdPatches)) {
                             for (const u of p.UsdPatches as unknown[]) {
                                 if (!u || typeof u !== "object") continue
                                 const uo = u as Record<string, unknown>
                                 if (!Array.isArray(uo.PropValues)) continue
-                                if (uo.PropName === "C_W" && !cwVals) cwVals = uo.PropValues as string[]
-                                else if (uo.PropName === "S_RoundRadius" && !radiusVals) radiusVals = uo.PropValues as string[]
+                                const upName = String(uo.PropName)
+                                const upVals = uo.PropValues as string[]
+                                if (upName === "C_W" && !cwVals) cwVals = upVals
+                                else if (upName === "S_RoundRadius" && !radiusVals) radiusVals = upVals
+                                else if (upVals.length >= 4) usdColors.push({ name: upName, vals: upVals })
+                                else usdNums.push({ name: upName, vals: upVals })
                             }
                         }
                         const hasCw = !!cwVals && cwVals.length >= 4
@@ -946,13 +962,43 @@ const collectLayoutNodes = (root: unknown): LayoutEntryNode[] => {
                             hasRadius,
                             radiusRef: hasRadius ? radiusVals : null,
                             radius,
+                            usdColors,
+                            usdNums,
                             fileIdx,
                             patchIdx,
                             fileName: obj.FileName as string,
                         })
                     }
+                    // 收集文件级数组条目：AddGroups / RemoveGroups / Materials（无坐标，仅 JSON 编辑）
+                    const collectEntry = (arr: unknown, key: string, nameKey: string) => {
+                        if (!Array.isArray(arr)) return
+                        for (const [ei, en] of (arr as unknown[]).entries()) {
+                            if (!en || typeof en !== "object") continue
+                            const eo = en as Record<string, unknown>
+                            const nameVal = typeof eo[nameKey] === "string" ? (eo[nameKey] as string) : `${key} #${ei + 1}`
+                            nodes.push({
+                                kind: "entry",
+                                id: fileBase ? `${fileBase} · ${nameVal}` : nameVal,
+                                visible: true,
+                                x: 0, y: 0, width: 0, height: 0, zIndex: 0, displayX: 0, displayY: 0,
+                                sizeX: 0, sizeY: 0,
+                                hasPosition: false, hasX: false, hasY: false, hasVisible: false, visibleKey: "Visible",
+                                ref: eo,
+                                posRef: null,
+                                hasScale: false, hasScaleX: false, hasScaleY: false, sx: 0, sy: 0, scaleRef: null,
+                                hasCw: false, cwVals: null, cwR: 0, cwG: 0, cwB: 0, cwA: 0,
+                                hasSize: false, hasSizeX: false, hasSizeY: false, sizeRef: null,
+                                hasRadius: false, radiusRef: null, radius: 0,
+                                usdColors: [], usdNums: [],
+                                fileIdx, entryKind: key, entryIdx: ei, entryKey: key, fileName: obj.FileName as string,
+                            })
+                        }
+                    }
+                    collectEntry(obj.AddGroups, "AddGroups", "GroupName")
+                    collectEntry(obj.RemoveGroups, "RemoveGroups", "GroupName")
+                    collectEntry(obj.Materials, "Materials", "MaterialName")
+                    for (const child of Object.values(obj)) collectPatch(child)
                 }
-                for (const child of Object.values(obj)) collectPatch(child)
             }
         } else if (value && typeof value === "object") {
             for (const child of Object.values(value)) collectPatch(child)
@@ -1006,6 +1052,8 @@ const collectLayoutNodes = (root: unknown): LayoutEntryNode[] => {
                         hasRadius: false,
                         radiusRef: null,
                         radius: 0,
+                        usdColors: [],
+                        usdNums: [],
                         fileName: obj.FileName as string,
                     })
                 }
@@ -1068,9 +1116,267 @@ const resolvePatchPositions = (nodes: LayoutEntryNode[]) => {
     }
 }
 
+// ===================== 固件版本兼容（11.0 / 20.0 breaking changes） =====================
+// 依据：SwitchThemeInjector wiki「Breaking changes with firmware 11.0 / 20.0」+ NewFirmFixes.cs + issue#156
+// 11.0：HomeMenu 新增 Switch Online 按钮（RdtBtnLR.bflyt，Pane 为 L_BtnLR），由 anim/RdtBase_SystemAppletPos.bflan 启用并右移居中。
+// 20.0：新增 L_BtnSplay / L_BtnVgc 两个按钮，整体右移其余按钮，并移除 anim/RdtBase_SystemAppletPos.bflan 动画。
+// 19.x 旧元素：位置/大小/可见性在 20.0 中与 19.x 不同，针对 19.x 布局的修改在 20.0 固件上可能错位。
+const FW19_LEGACY_PANES = [
+    "N_System", "L_BtnLR", "L_BtnNoti", "L_BtnShop", "L_BtnPvr", "L_BtnCtrl", "L_BtnSet", "L_BtnPow",
+]
+// 20.0 新增元素在 RdtBase.bflyt 中的默认 X（相对 N_System，取自 20.0 系统默认布局 defaults.json）
+const FW20_NEW_BTN_DEFAULTS: Record<string, { X: number }> = {
+    L_BtnSplay: { X: 54 },
+    L_BtnVgc: { X: 234 },
+}
+
+// 当前布局的目标固件档位：fw11=10.x 及更早（旧布局，无 Switch Online 按钮）、
+// fw19=11~19.x（Switch Online 按钮 + SystemAppletPos 动画时代）、
+// fw20=20.x 及更新（新增 L_BtnSplay/L_BtnVgc、移除 SystemAppletPos 动画）、unknown=无法识别
+type FwTier = "fw11" | "fw19" | "fw20" | "unknown"
+const layoutFwState = ref<FwTier>("unknown")
+// 各档位切换时写回的 TargetFirmware 值
+// NXThemesInstaller 的 TargetFirmware 是 ConsoleFirmware 枚举的整数（非版本号字符串）：
+//   Fw9_0=900（9~10.x）、Fw11_0=1100（11~19.x）、Fw20_0=2000（20.x+）
+// 写字符串（如 "20.0.0"）会被安装器解析报 [json.exception.type_error.302]。
+const FW_TARGET_VALUES: Record<Exclude<FwTier, "unknown">, number> = {
+    fw11: 900, // 10.x 及更早，无 Switch Online 按钮
+    fw19: 1100, // 11~19.x，有 Switch Online 按钮（RdtBase_SystemAppletPos）
+    fw20: 2000, // 20.x+
+}
+
+const detectLayoutFirmware = () => {
+    layoutFwState.value = "unknown"
+    if (!layoutParsed.value || typeof layoutParsed.value !== "object" || Array.isArray(layoutParsed.value)) return
+    const root = layoutParsed.value as Record<string, unknown>
+    const tf = root.TargetFirmware
+    let major: number | null = null
+    if (typeof tf === "number") major = tf
+    else if (typeof tf === "string") {
+        const m = tf.match(/(\d+)/)
+        if (m) major = Number(m[1])
+    }
+    if (major != null) {
+        // TargetFirmware 有两种形态，需分别解读：
+        //   A) ConsoleFirmware 枚举整数：Fw9_0=900、Fw11_0=1100、Fw20_0=2000（及 Fw5_0=500 等更早）
+        //   B) 版本数字面量：20、11~19、10 等（旧编辑器/字符串形式，如 "20.0.0" → 20）
+        const tier =
+            major >= 2000 ? "fw20" :
+            major >= 1100 ? "fw19" :
+            major >= 100 ? "fw11" : // 枚举值 900 及更早（9~10.x 及更早，无 Switch Online 按钮）
+            major >= 20 ? "fw20" :  // 版本字面 20
+            major >= 11 ? "fw19" :  // 版本字面 11~19
+            "fw11"                  // 版本字面 10 及更早
+        layoutFwState.value = tier
+        return
+    }
+    // 无 TargetFirmware：按官方检测规则（FirmwareDetection.cs）推断
+    //   fw20：含 RdtBtnSplay.bflyt 且不含 anim/RdtBase_SystemAppletPos.bflan
+    //   fw19：含 RdtBtnLR.bflyt（11.0 起新增的 Switch Online 按钮，覆盖 11~19.x）
+    //   fw11：更早（不含上述特征文件）
+    // 特征文件检测需覆盖 Files 与 Anims 两个数组（动画文件位于 Anims）
+    const entries = [
+        ...(Array.isArray(root.Files) ? (root.Files as Record<string, unknown>[]) : []),
+        ...(Array.isArray(root.Anims) ? (root.Anims as Record<string, unknown>[]) : []),
+    ]
+    const hasFile = (suffix: string) => entries.some((f) => typeof f.FileName === "string" && f.FileName.endsWith(suffix))
+    // 特征也检查 Patch 的 PaneName（迁移只补 L_BtnSplay/L_BtnLR 的 Patch，不会新增独立 blyt 文件）
+    const files = Array.isArray(root.Files) ? (root.Files as Record<string, unknown>[]) : []
+    const hasPatch = (pane: string) =>
+        files.some((f) => Array.isArray(f.Patches) && (f.Patches as Record<string, unknown>[]).some((p) => p?.PaneName === pane))
+    // fw20：含 20.x 新按钮且不含 SystemAppletPos 动画
+    if ((hasPatch("L_BtnSplay") || hasFile("RdtBtnSplay.bflyt")) && !hasFile("RdtBase_SystemAppletPos.bflan")) layoutFwState.value = "fw20"
+    // fw19：含 SystemAppletPos 动画 或 有 Switch Online 按钮（RdtBtnLR.bflyt / L_BtnLR）
+    else if (hasFile("RdtBase_SystemAppletPos.bflan") || hasFile("RdtBtnLR.bflyt") || hasPatch("L_BtnLR")) layoutFwState.value = "fw19"
+    else layoutFwState.value = "fw11"
+}
+
+// 该元素是否为 19.x 旧元素（仅当目标固件为 20+ 时标红）
+const isFw19Legacy = (node: LayoutEntryNode): boolean =>
+    layoutFwState.value === "fw20" &&
+    node.kind === "patch" &&
+    typeof (node.ref.PaneName as string) === "string" &&
+    FW19_LEGACY_PANES.includes(node.ref.PaneName as string)
+
+// 从布局（Files + Anims）中移除指定文件名条目（用于删除 RdtBase_SystemAppletPos 动画）
+const removeLayoutFile = (root: Record<string, unknown>, suffix: string): boolean => {
+    let removed = false
+    for (const key of ["Files", "Anims"] as const) {
+        const arr = root[key]
+        if (!Array.isArray(arr)) continue
+        const idx = (arr as Record<string, unknown>[]).findIndex(
+            (f) => typeof f.FileName === "string" && f.FileName.endsWith(suffix)
+        )
+        if (idx >= 0) {
+            ;(arr as unknown[]).splice(idx, 1)
+            removed = true
+        }
+    }
+    return removed
+}
+
+// 11~19.x 需要 Switch Online 按钮（L_BtnLR）及启用它的 SystemAppletPos 动画。
+// 迁移到 fw19 时按官方初始值补上（动画仅为占位帧，用于让固件启用按钮；按钮文件 RdtBtnLR.bflyt 在 11~19 底包中已存在）
+const SYSTEM_APPLET_POS_ANIM_JSON =
+    "{\"LittleEndian\":true,\"Version\":150994944,\"pat1\":{\"AnimationOrder\":6,\"ChildBinding\":190,\"Groups\":[\"G_System\"],\"Unk_StartOfFile\":0,\"Unk_EndOfFile\":0,\"Unk_EndOfHeader\":\"AL8AAAAAAA==\"},\"pai1\":{\"FrameSize\":1,\"Flags\":1,\"Textures\":[],\"Entries\":[]}}"
+
+// 确保布局 Anims 中含指定动画条目（不重复添加）
+const ensureAnimEntry = (root: Record<string, unknown>, fileName: string, animJson: string): void => {
+    const anims = Array.isArray(root.Anims) ? (root.Anims as Record<string, unknown>[]) : (root.Anims = [])
+    if (!anims.some((a) => typeof a?.FileName === "string" && a.FileName === fileName)) {
+        anims.push({ FileName: fileName, AnimJson: animJson })
+    }
+}
+
+// 确保 Files 中含指定 blyt 文件条目（空引用，用于让该按钮文件包含进主题）
+const ensureFileRef = (root: Record<string, unknown>, fileName: string): void => {
+    const files = Array.isArray(root.Files) ? (root.Files as Record<string, unknown>[]) : (root.Files = [])
+    if (!files.some((f) => typeof f?.FileName === "string" && f.FileName === fileName)) {
+        files.push({ FileName: fileName, Patches: [], AddGroups: [] })
+    }
+}
+
+// 迁移确认弹窗状态：点击徽章后仅弹出确认，用户点「确认迁移」后才真正迁移
+// removed：本次迁移将删除的不兼容元素（仅迁移到 20.X+ 时通常含 SystemAppletPos 动画），供弹窗底部表格展示
+const fwMigrateConfirm = ref<{ next: Exclude<FwTier, "unknown">; msg: string; removed: string[] } | null>(null)
+
+// 点击固件徽章：20.X+ 已禁用（不可降级）；低版本只弹出确认弹窗，不直接迁移
+const cycleLayoutFirmware = () => {
+    if (layoutParsed.value == null || typeof layoutParsed.value !== "object" || Array.isArray(layoutParsed.value)) return
+    const root = layoutParsed.value as Record<string, unknown>
+    const cur = layoutFwState.value
+    if (cur === "unknown" || cur === "fw20") return
+    const next: Exclude<FwTier, "unknown"> = cur === "fw11" ? "fw19" : "fw20"
+    // 待删除的 19.x 不兼容元素（仅当前布局实际含有的；迁移到 fw19 无删除项）
+    const allFiles = [
+        ...(Array.isArray(root.Files) ? (root.Files as Record<string, unknown>[]) : []),
+        ...(Array.isArray(root.Anims) ? (root.Anims as Record<string, unknown>[]) : []),
+    ]
+    const removed = allFiles
+        .filter((f) => typeof f?.FileName === "string" && f.FileName.endsWith("RdtBase_SystemAppletPos.bflan"))
+        .map((f) => f.FileName)
+    const msg = next === "fw19"
+        ? "即将迁移到 11~19.X：\n\n· 将补上 Switch Online 按钮（L_BtnLR / RdtBtnLR.bflyt）及启用它的 RdtBase_SystemAppletPos 动画\n· 将 HideOnlineBtn 设为 false（显示 Switch Online 按钮）\n· TargetFirmware 将写为 19.0.0"
+        : "即将迁移到 20.X+：\n\n· 19 旧元素（N_System 等）将标红提示\n· 缺失的 20.x 新元素（L_BtnSplay / L_BtnVgc）将自动补充\n· TargetFirmware 将写为 20.0.0\n· 迁移后仍需要调整后才能使用"
+    fwMigrateConfirm.value = { next, msg, removed }
+}
+
+// 用户点「确认迁移」后才真正执行迁移
+const confirmMigrateFirmware = () => {
+    const c = fwMigrateConfirm.value
+    if (!c) return
+    fwMigrateConfirm.value = null
+    doMigrateFirmware(c.next)
+}
+
+// 实际执行迁移（写入 TargetFirmware、处理 10.X→19.X 的动画/HideOnlineBtn，然后重建预览）
+const doMigrateFirmware = (next: Exclude<FwTier, "unknown">) => {
+    if (layoutParsed.value == null || typeof layoutParsed.value !== "object" || Array.isArray(layoutParsed.value)) return
+    const root = layoutParsed.value as Record<string, unknown>
+    root.TargetFirmware = FW_TARGET_VALUES[next]
+    if (next === "fw19") {
+        // 11~19.x 需要 Switch Online 按钮及其启用动画，迁移时补上（而不是删除）
+        root.HideOnlineBtn = false
+        ensureFileRef(root, "blyt/RdtBtnLR.bflyt")
+        ensureAnimEntry(root, "anim/RdtBase_SystemAppletPos.bflan", SYSTEM_APPLET_POS_ANIM_JSON)
+    } else if (next === "fw20") {
+        // 20.x 已移除 Switch Online 按钮（SystemAppletPos）动画，必须一并删除，
+        // 否则安装器按 fw20 底包编译时在 Files/Anims 中找不到该布局而报"不兼容的自定义布局"。
+        removeLayoutFile(root, "RdtBase_SystemAppletPos.bflan")
+    }
+    layoutMetaWriteBack()
+    detectLayoutFirmware()
+    rebuildLayoutPreview()
+}
+
+// 固件徽章文案 / 样式 / 提示
+const FW_BADGE_META: Record<Exclude<FwTier, "unknown">, { text: string; title: string; cls: string }> = {
+    fw11: {
+        text: "10.X 前",
+        title: "目标 10.x 及更早（旧布局，无 Switch Online 按钮）。点击迁移到 11~19.X（将补上 Switch Online 按钮及其启用动画）。",
+        cls: "border-rose-500/60 bg-rose-500/15 text-rose-300 hover:bg-rose-500/25",
+    },
+    fw19: {
+        text: "11~19.X",
+        title: "目标 11.0-19.x（Switch Online 按钮 + SystemAppletPos 动画时代）。点击迁移到 20.X+（将标红 19 旧元素并自动补充 20 新元素）。",
+        cls: "border-amber-500/60 bg-amber-500/15 text-amber-300 hover:bg-amber-500/25",
+    },
+    fw20: {
+        text: "20.X+",
+        title: "目标 20.x 及更新（新增 L_BtnSplay/L_BtnVgc，无 SystemAppletPos 动画；19 旧元素已标红）。已是最高档位，固件档位只能从低版本向高版本迁移，不能降级。",
+        cls: "border-emerald-500/60 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25 cursor-not-allowed",
+    },
+}
+const fwBadge = computed(() => {
+    const s = layoutFwState.value
+    return s === "unknown" ? null : FW_BADGE_META[s]
+})
+
+// 主菜单（blyt/RdtBase.bflyt）缺失的 20.0 新元素
+const missingFw20Elements = computed<string[]>(() => {
+    if (layoutFwState.value !== "fw20" || !layoutParsed.value || typeof layoutParsed.value !== "object" || Array.isArray(layoutParsed.value)) return []
+    const root = layoutParsed.value as Record<string, unknown>
+    const files = Array.isArray(root.Files) ? (root.Files as Record<string, unknown>[]) : []
+    const rdt = files.find((f) => typeof f.FileName === "string" && f.FileName.endsWith("RdtBase.bflyt"))
+    const patches = rdt && Array.isArray(rdt.Patches) ? (rdt.Patches as Record<string, unknown>[]) : []
+    return Object.keys(FW20_NEW_BTN_DEFAULTS).filter((p) => !patches.some((x) => x.PaneName === p))
+})
+
+const fwFillToast = ref("")
+// 本次会话中通过固件迁移自动补充的 20.x 新元素（仅内存态，刷新页面后清空；用于列表高亮 + "20" 徽章）
+const fwMigratedNewPanels = ref<string[]>([])
+
+// 自动补充 20.0 新元素默认值（写入主菜单 RdtBase.bflyt）
+const fillFw20Defaults = () => {
+    if (layoutParsed.value == null || typeof layoutParsed.value !== "object" || Array.isArray(layoutParsed.value)) return
+    const root = layoutParsed.value as Record<string, unknown>
+    const files = Array.isArray(root.Files) ? (root.Files as Record<string, unknown>[]) : []
+    let rdt = files.find((f) => typeof f.FileName === "string" && f.FileName.endsWith("RdtBase.bflyt"))
+    if (!rdt) {
+        rdt = { FileName: "blyt/RdtBase.bflyt", Patches: [] }
+        files.push(rdt)
+    }
+    const patches = Array.isArray(rdt.Patches) ? (rdt.Patches as Record<string, unknown>[]) : (rdt.Patches = [])
+    const added: string[] = []
+    for (const [pane, pos] of Object.entries(FW20_NEW_BTN_DEFAULTS)) {
+        if (!patches.some((p) => p.PaneName === pane)) {
+            patches.push({ PaneName: pane, Position: { X: pos.X } })
+            added.push(pane)
+        }
+    }
+    if (!added.length) return
+    // 记录本次会话迁移新增的 20.x 元素，用于列表高亮（带 "20" 徽章，仅本次会话）
+    for (const p of added) {
+        if (!fwMigratedNewPanels.value.includes(p)) fwMigratedNewPanels.value.push(p)
+    }
+    layoutMetaWriteBack()
+    rebuildLayoutPreview()
+    fwFillToast.value = `已迁移到 20.X+：自动补充 20.x 新元素 ${added.join("、")}，已在元素列表中高亮（本次会话）`
+    window.setTimeout(() => { fwFillToast.value = "" }, 4000)
+}
+
+// 该元素是否为本次迁移新增的 20.x 元素（列表高亮 + "20" 徽章，仅本次会话）
+const isMigratedNewFw20 = (node: LayoutEntryNode): boolean =>
+    node.kind === "patch" &&
+    typeof (node.ref.PaneName as string) === "string" &&
+    fwMigratedNewPanels.value.includes(node.ref.PaneName as string)
+
+// 目标固件变为 20+ 时自动补充缺失的 20.x 新元素
+watch(layoutFwState, (nv) => {
+    if (nv === "fw20") {
+        // 自愈：fw20 布局若仍残留 fw19 专属的 SystemAppletPos 动画（旧迁移产物），
+        // 一并删除，避免安装器在 fw20 底包中找不到该布局而报"不兼容的自定义布局"。
+        if (layoutParsed.value && typeof layoutParsed.value === "object") {
+            removeLayoutFile(layoutParsed.value as Record<string, unknown>, "RdtBase_SystemAppletPos.bflan")
+        }
+        fillFw20Defaults()
+    }
+})
+
 const rebuildLayoutPreview = () => {
     layoutNodes.value = []
     layoutParsed.value = null
+    layoutFwState.value = "unknown"
     selectedLayoutIndex.value = null
     const json = form.value.layoutJson
     if (!json.trim()) return
@@ -1080,6 +1386,7 @@ const rebuildLayoutPreview = () => {
         const nodes = collectLayoutNodes(parsed)
         resolvePatchPositions(nodes)
         layoutNodes.value = nodes
+        detectLayoutFirmware()
     } catch {
         // JSON 无效时不展示预览，保留原文编辑
     }
@@ -1100,32 +1407,52 @@ const selectedLayoutNode = computed<LayoutEntryNode | null>(() => {
     return layoutNodes.value[selectedLayoutIndex.value] ?? null
 })
 
-const layoutBoxStyle = (node: LayoutEntryNode) => {
-    const x = Number(node.x) || 0
-    const y = Number(node.y) || 0
-    const width = Math.max(0, Number(node.width) || 0)
-    const height = Math.max(0, Number(node.height) || 0)
-    return {
-        left: `${(x / LAYOUT_CANVAS_W) * 100}%`,
-        top: `${(y / LAYOUT_CANVAS_H) * 100}%`,
-        width: `${(width / LAYOUT_CANVAS_W) * 100}%`,
-        height: `${(height / LAYOUT_CANVAS_H) * 100}%`,
-        zIndex: Number(node.zIndex) || 0,
-    }
-}
+// 当前聚焦的补丁元素：设置了"显示区域"（Size）时在背景图上绘制其位置框。
+// 无 Size 或 Size 不全时，仅 20.X+ 布局可用官方默认 Size 补全绘制（defaults.json 源自 20 固件）
+const focusedSizeNode = computed<LayoutEntryNode | null>(() => {
+    const n = selectedLayoutNode.value
+    if (!n || n.kind !== "patch") return null
+    if (n.hasSize) return n
+    if (layoutFwState.value !== "fw20") return null
+    const def = layoutDefaults.value[nodeLabelKey(n)] ?? layoutDefaults.value[nodePaneName(n)]
+    return def && def.Size ? n : null
+})
 
 // patch 格式：坐标是"屏幕中心原点、+Y 朝上"，需换算成左上角原点再渲染
 // 屏幕X = 640 + x；屏幕Y = 360 - y
 const layoutPatchBoxStyle = (node: LayoutEntryNode) => {
-    const sx = LAYOUT_CANVAS_W / 2 + node.displayX
-    const sy = LAYOUT_CANVAS_H / 2 - node.displayY
-    const w = node.sizeX > 0 ? node.sizeX : 64
-    const h = node.sizeY > 0 ? node.sizeY : 56
+    // Size / Position：patch 未设置时回退到该 Pane 的官方默认值（defaults.json）
+    let w = node.sizeX
+    let h = node.sizeY
+    // 默认屏幕坐标（patch 未设 Position 时用），保持中心原点约定
+    let defPx: number | null = null
+    let defPy: number | null = null
+    if (!(node.hasSizeX && w > 0) || !(node.hasSizeY && h > 0) || !node.hasPosition) {
+        const def = layoutDefaults.value[nodeLabelKey(node)] ?? layoutDefaults.value[nodePaneName(node)]
+        const sz = def?.Size as { X?: unknown; Y?: unknown } | undefined
+        const pos = def?.Position as { X?: unknown; Y?: unknown } | undefined
+        const fnum = (v: unknown): number | null =>
+            v != null && v !== "" && Number.isFinite(Number(v)) ? Number(v) : null
+        if (!(node.hasSizeX && w > 0)) { const d = fnum(sz?.X); if (d != null && d > 0) w = d }
+        if (!(node.hasSizeY && h > 0)) { const d = fnum(sz?.Y); if (d != null && d > 0) h = d }
+        // patch 没设 Position 时，用默认 Position 作为屏幕锚点，避免被丢到屏幕中心 (640,360)
+        if (!node.hasX) defPx = fnum(pos?.X)
+        if (!node.hasY) defPy = fnum(pos?.Y)
+    }
+    const width = w > 0 ? w : 64
+    const height = h > 0 ? h : 56
+    const px = node.hasX ? node.displayX : (defPx ?? node.displayX)
+    const py = node.hasY ? node.displayY : (defPy ?? node.displayY)
+    const sx = LAYOUT_CANVAS_W / 2 + px
+    const sy = LAYOUT_CANVAS_H / 2 - py
+    // 全屏背景类 Pane（如 L_BgNml）锚定在左上角 (0,0)，应铺满整屏。
+    // 直接用中心原点换算（640+x / 360-y）会把满屏框偏移到右下四分之一，这里强制归零。
+    const isFullscreen = width >= LAYOUT_CANVAS_W - 1 && height >= LAYOUT_CANVAS_H - 1
     return {
-        left: `${(sx / LAYOUT_CANVAS_W) * 100}%`,
-        top: `${(sy / LAYOUT_CANVAS_H) * 100}%`,
-        width: `${(w / LAYOUT_CANVAS_W) * 100}%`,
-        height: `${(h / LAYOUT_CANVAS_H) * 100}%`,
+        left: `${((isFullscreen ? 0 : sx) / LAYOUT_CANVAS_W) * 100}%`,
+        top: `${((isFullscreen ? 0 : sy) / LAYOUT_CANVAS_H) * 100}%`,
+        width: `${(width / LAYOUT_CANVAS_W) * 100}%`,
+        height: `${(height / LAYOUT_CANVAS_H) * 100}%`,
     }
 }
 
@@ -1259,6 +1586,33 @@ const initPaneLabels = async () => {
     } catch {
         // 完全离线：仅用内联数据 + localStorage
     }
+}
+
+// 官方默认值表：复合键 blyt/<文件>.bflyt::<Pane> → { Position, Scale, Size, Visible }
+// 来源：scripts/extract-defaults.mjs 从 systemData/*/blyt 提取；构建时内联到 HTML。
+const layoutDefaults = ref<Record<string, any>>({})
+const initLayoutDefaults = async () => {
+    const apply = (data: unknown) => {
+        if (data && typeof data === "object") {
+            layoutDefaults.value = { ...layoutDefaults.value, ...(data as Record<string, any>) }
+        }
+    }
+    // 1) 构建内联数据（file:// 双击打开也能用）
+    const el = document.getElementById("defaults-data")
+    if (el?.textContent) {
+        try { apply(JSON.parse(el.textContent)) } catch { /* 内容非法则忽略 */ }
+    }
+    try {
+        // 2) 同目录静态文件，存在时以最新为准（localhost 下修改后可刷新读取）
+        const r = await fetch("./applets/dll/defaults.json", { cache: "no-store" })
+        if (r.ok) { apply(await r.json()); return }
+    } catch {
+        // 3) 离线（file://）下回退到预览服务 API
+    }
+    try {
+        const r = await fetch("/api/defaults")
+        if (r.ok) apply(await r.json())
+    } catch { /* 完全离线：仅用内联数据 */ }
 }
 
 const nodePaneName = (node: LayoutEntryNode): string =>
@@ -1395,6 +1749,26 @@ const layoutLineOfNode = (node: LayoutEntryNode): number => {
         if (p < 0) return -1
         return text.slice(0, p).split("\n").length
     }
+    if (node.kind === "entry") {
+        const fileFull = node.fileName ?? ""
+        if (!fileFull || !node.entryKey) return -1
+        const fileRe = new RegExp(`"FileName"\\s*:\\s*${JSON.stringify(fileFull)}`)
+        const pos = findAfter(text, fileRe, 0)
+        if (pos < 0) return -1
+        // 统计该文件内 entryKey 出现的次数，定位到第 entryIdx 个
+        const keyRe = new RegExp(`"${escapeRegExp(node.entryKey)}"`)
+        let p = pos
+        let c = -1
+        while (true) {
+            const k = findAfter(text, keyRe, p + 1)
+            if (k < 0) break
+            c++
+            p = k
+            if (c >= (node.entryIdx ?? 0)) break
+        }
+        if (p < 0) return -1
+        return text.slice(0, p).split("\n").length
+    }
     // HomeMenu 数组格式：按 id 定位
     const idPos = text.indexOf(`"id": ${JSON.stringify(node.id)}`)
     if (idPos < 0) return -1
@@ -1437,14 +1811,6 @@ const onSelectLayoutNode = (index: number, node: LayoutEntryNode) => {
             }
         }
         ta.scrollTop = Math.max(0, (line - 4) * 18) // 兜底：估算行高
-    })
-}
-
-// 点预览图上的元素 -> 元素表格滚动聚焦到对应行
-const onOverlaySelect = (index: number) => {
-    selectedLayoutIndex.value = index
-    nextTick(() => {
-        document.getElementById(`layout-row-${index}`)?.scrollIntoView({ block: "nearest", inline: "nearest" })
     })
 }
 
@@ -1496,22 +1862,18 @@ const layoutIconUrl = (node: LayoutEntryNode): string | null => {
     return presetIconUrl(key)
 }
 
-// 叠加层的样式类（icon 有图时不画底色；无图元素只保留半透明底色，不加外边框）
-const layoutOverlayClasses = (node: LayoutEntryNode, i: number): string => {
-    const isIcon = !!layoutIconUrl(node)
-    const base = isIcon
-        ? "pointer-events-auto absolute cursor-pointer rounded-md transition-opacity"
-        : "pointer-events-auto absolute cursor-pointer rounded-md transition-colors"
-    if (i === selectedLayoutIndex.value) {
-        return isIcon ? `${base} ring-2 ring-primary-400` : `${base} bg-primary-400/25 ring-1 ring-primary-400`
-    }
-    if (!node.visible) return `${base} opacity-70`
-    return isIcon ? base : `${base} bg-sky-400/10 hover:bg-sky-400/20`
-}
-
 // 布局元素列表的搜索与过滤
 const layoutSearch = ref("")
 const layoutShowPositionedOnly = ref(false)
+// 布局元素面板放大（浏览器式）：展开后从预览图片区域顶端延伸到卡片底部，再点收起
+const layoutElementsExpanded = ref(false)
+// 展开时面板的定位样式：从图片容器顶部开始覆盖，避免盖住标题行/浪费空白
+const layoutExpandStyle = computed(() => {
+    if (!layoutElementsExpanded.value) return {} as Record<string, string>
+    const el = bgPreviewRef.value
+    const top = el ? el.offsetTop : 0
+    return { top: `${top}px`, bottom: "0px", backgroundColor: "#0f172a" }
+})
 
 const filteredLayoutNodes = computed<{ node: LayoutEntryNode; index: number }[]>(() => {
     const keyword = layoutSearch.value.trim().toLowerCase()
@@ -1583,6 +1945,7 @@ onMounted(() => {
         new ResizeObserver(() => computeBgImgRect()).observe(el)
     }
     initPaneLabels()
+    initLayoutDefaults()
 })
 
 const LAYOUT_META_LABELS: Record<string, string> = {
@@ -1905,9 +2268,11 @@ const deleteMethod = (i: number) => {
 // 保存方法的反馈提示（避免"点了没反应"）
 const methodSaveError = ref("")
 const methodSaveToast = ref("")
+const methodToastError = ref(false)
 let methodToastTimer: ReturnType<typeof setTimeout> | null = null
-const showMethodToast = (msg: string) => {
+const showMethodToast = (msg: string, isError = false) => {
     methodSaveToast.value = msg
+    methodToastError.value = isError
     if (methodToastTimer) clearTimeout(methodToastTimer)
     methodToastTimer = setTimeout(() => { methodSaveToast.value = "" }, 3000)
 }
@@ -1974,8 +2339,8 @@ const onMethodImportFile = (e: Event) => {
                 }
             }
             persistMethods()
-            if (added) showMethodToast(`✓ 已导入 ${added} 个方法${skipped ? `，跳过 ${skipped} 个同名` : ""}`)
-            else showMethodToast(skipped ? `⚠ 全部同名已跳过（${skipped} 个），可先重命名再导入` : "⚠ 文件里没有有效的方法")
+            if (added) showMethodToast(`✓ 已导入 ${added} 个方法${skipped ? `，跳过 ${skipped} 个` : ""}`)
+            else showMethodToast(skipped ? `⚠ 跳过 ${skipped} 个：不支持的方法格式（layout 布局文件不可直接导入，请先载入布局后点「保存当前布局为方法」）` : "⚠ 文件里没有有效的方法")
         } catch {
             showMethodToast("⚠ 导入失败：不是有效的方法文件")
         }
@@ -2105,8 +2470,78 @@ const mergePatchFiles = (targetFiles: unknown[], sourceFiles: unknown[]) => {
     }
 }
 
+// ===================== 方法版本识别与一致性（与当前布局档位匹配） =====================
+// 方法档位：generic=通用（不含版本特征，可应用于任意固件）、fw19=11~19.X、fw20=20.X+
+type MethodFwTier = "generic" | "fw19" | "fw20"
+
+// 方法徽章样式 / 提示
+const METHOD_FW_BADGE: Record<MethodFwTier, { text: string; title: string; cls: string }> = {
+    generic: {
+        text: "通用",
+        title: "该方法不含版本特征元素，可应用于任意固件布局",
+        cls: "border-slate-600/60 bg-slate-600/15 text-slate-400",
+    },
+    fw19: {
+        text: "11~19.X",
+        title: "该方法含 11.0-19.x 特有元素（如 RdtBase_SystemAppletPos 动画），仅可应用于 11~19.X 布局",
+        cls: "border-amber-500/60 bg-amber-500/15 text-amber-300",
+    },
+    fw20: {
+        text: "20.X+",
+        title: "该方法含 20.x 特有元素（如 L_BtnSplay / L_BtnVgc），仅可应用于 20.X+ 布局",
+        cls: "border-emerald-500/60 bg-emerald-500/15 text-emerald-300",
+    },
+}
+
+// 识别方法的目标固件档位（依据：与布局检测一致的特征文件/元素）
+const detectMethodFirmware = (m: LayoutMethod): MethodFwTier => {
+    const data = m.data
+    if (!data || typeof data !== "object" || Array.isArray(data)) return "generic"
+    const root = data as Record<string, unknown>
+    const files = Array.isArray(root.Files) ? (root.Files as Record<string, unknown>[]) : []
+    const anims = Array.isArray(root.Anims) ? (root.Anims as Record<string, unknown>[]) : []
+    let hasFw20File = false
+    let hasFw20Patch = false
+    let hasSystemAppletPos = false
+    for (const f of files) {
+        const fn = typeof f.FileName === "string" ? f.FileName : ""
+        if (fn.endsWith("RdtBtnSplay.bflyt") || fn.endsWith("RdtBtnVgc.bflyt")) hasFw20File = true
+        if (Array.isArray(f.Patches)) {
+            for (const p of f.Patches as Record<string, unknown>[]) {
+                const pn = p.PaneName as string
+                if (pn === "L_BtnSplay" || pn === "L_BtnVgc") hasFw20Patch = true
+            }
+        }
+    }
+    for (const a of anims) {
+        if (typeof a.FileName === "string" && a.FileName.endsWith("RdtBase_SystemAppletPos.bflan")) hasSystemAppletPos = true
+    }
+    if (hasFw20Patch || (hasFw20File && !hasSystemAppletPos)) return "fw20"
+    if (hasSystemAppletPos) return "fw19"
+    return "generic"
+}
+
+// 方法与当前布局的版本一致性：方法含版本特征时，必须与当前布局档位一致才可应用
+const methodFwCompat = (m: LayoutMethod): { ok: boolean; methodFw: MethodFwTier; reason?: string } => {
+    const mfw = detectMethodFirmware(m)
+    if (mfw === "generic") return { ok: true, methodFw: mfw }
+    const lfw = layoutFwState.value
+    if (lfw === "unknown") {
+        return { ok: true, methodFw: mfw, reason: `方法版本为 ${METHOD_FW_BADGE[mfw].text}，当前布局版本无法识别，应用前请先确认目标固件。` }
+    }
+    const ok = (mfw === "fw19" && lfw === "fw19") || (mfw === "fw20" && lfw === "fw20")
+    return ok
+        ? { ok: true, methodFw: mfw }
+        : { ok: false, methodFw: mfw, reason: `方法版本（${METHOD_FW_BADGE[mfw].text}）与当前布局版本（${FW_BADGE_META[lfw].text}）不一致，无法应用。` }
+}
+
 // 把方法应用到当前布局（就地合并，然后回写 layout.json 并重建预览）
 const applyMethod = (m: LayoutMethod) => {
+    const compat = methodFwCompat(m)
+    if (!compat.ok) {
+        showMethodToast(`✗ 无法应用：${compat.reason}`, true)
+        return
+    }
     if (!layoutParsed.value) {
         // 无布局时，直接克隆方法的数据作为新布局
         layoutParsed.value = safeClone(m.data)
@@ -2131,8 +2566,14 @@ const applyMethod = (m: LayoutMethod) => {
             if (!Array.isArray(parsed.Files)) parsed.Files = []
             mergePatchFiles(parsed.Files as unknown[], data.Files as unknown[])
         }
-        if (Array.isArray(data.Anims) && Array.isArray(parsed.Anims)) {
-            const byName = new Map((parsed.Anims as unknown[]).map((a) => [(a as Record<string, unknown>).FileName as string, a]))
+        if (Array.isArray(data.Anims)) {
+            const byName = new Map<string, unknown>()
+            if (Array.isArray(parsed.Anims)) {
+                for (const a of parsed.Anims as unknown[]) {
+                    const an = (a as Record<string, unknown>).FileName as string
+                    if (typeof an === "string") byName.set(an, a)
+                }
+            }
             for (const sa of data.Anims as unknown[]) {
                 const an = (sa as Record<string, unknown>).FileName as string
                 if (typeof an === "string") byName.set(an, safeClone(sa))
@@ -2278,6 +2719,129 @@ const cwDisplay = computed<string>(() => {
     return `${Math.round(n.cwR)}, ${Math.round(n.cwG)}, ${Math.round(n.cwB)}, ${Math.round(n.cwA)}`
 })
 
+// ============ 其它材质属性（UsdPatches：C_B、S_BorderColor0、S_BorderSize 等）编辑 ============
+// 除 C_W（主图层颜色）与 S_RoundRadius（圆角，已有专属区块）外的 UsdPatch 统一在此编辑：
+// 4 值 → 颜色（RGBA），单值 → 数值（窗格样式/ID 等）。通过引用直接改 PropValues 数组写回。
+
+const usdColors = computed<{ name: string; vals: string[] }[]>(() =>
+    selectedLayoutNode.value && selectedLayoutNode.value.kind === "patch" ? selectedLayoutNode.value.usdColors : [],
+)
+const usdNums = computed<{ name: string; vals: string[] }[]>(() =>
+    selectedLayoutNode.value && selectedLayoutNode.value.kind === "patch" ? selectedLayoutNode.value.usdNums : [],
+)
+
+// C_B 次图层颜色（若有）：与 C_W 同时存在时并排显示（各占一半空间）
+const cbColor = computed<{ name: string; vals: string[] } | null>(() => {
+    const node = selectedLayoutNode.value
+    if (!node || node.kind !== "patch") return null
+    return node.usdColors.find((c) => c.name === "C_B") ?? null
+})
+// 除 C_B 外的其它 4 值颜色（C_B 已与 C_W 并排显示时，不再在「其它颜色」中重复列出）
+const otherUsdColors = computed<{ name: string; vals: string[] }[]>(() =>
+    cbColor.value ? usdColors.value.filter((c) => c.name !== "C_B") : usdColors.value,
+)
+
+// 颜色类：从 PropValues[0..2] 生成 #RRGGBB
+const usdColorHex = (c: { name: string; vals: string[] }): string => {
+    const h = (i: number) => {
+        const v = Number(c.vals[i])
+        return (Number.isFinite(v) ? Math.min(255, Math.max(0, Math.round(v))) : 0).toString(16).padStart(2, "0")
+    }
+    return `#${h(0)}${h(1)}${h(2)}`
+}
+const usdColorDisplay = (c: { name: string; vals: string[] }): string =>
+    c.vals.slice(0, 4).map((v) => (Number.isFinite(Number(v)) ? Math.round(Number(v)) : 0)).join(", ")
+const usdAlpha = (c: { name: string; vals: string[] }): number => {
+    const v = Number(c.vals[3])
+    return Number.isFinite(v) ? Math.min(255, Math.max(0, Math.round(v))) : 0
+}
+
+// 颜色 input → 写回 RGB
+const setUsdColorHex = (c: { name: string; vals: string[] }, hex: string) => {
+    c.vals[0] = String(parseInt(hex.slice(1, 3), 16) || 0)
+    c.vals[1] = String(parseInt(hex.slice(3, 5), 16) || 0)
+    c.vals[2] = String(parseInt(hex.slice(5, 7), 16) || 0)
+    writeBackLayout()
+}
+// 透明度 → 写回 A
+const setUsdColorAlpha = (c: { name: string; vals: string[] }, v: number) => {
+    if (Number.isFinite(v)) {
+        c.vals[3] = String(Math.min(255, Math.max(0, Math.round(v))))
+        writeBackLayout()
+    }
+}
+// 数值类 → 写回单值
+const setUsdNum = (n: { name: string; vals: string[] }, raw: string) => {
+    const num = Number(raw)
+    if (raw.trim() !== "" && Number.isFinite(num)) {
+        n.vals[0] = String(num)
+        writeBackLayout()
+    }
+}
+
+// ============ 默认颜色扩展（layout 中没有时，按官方默认添加） ============
+// 读取 defaults.json 中该 Pane 的 UsdPatches，找出 layout 中缺失的 4 值颜色类属性（C_W/C_B/S_BorderColor0/S_DropShadowColor 等），
+// 在详情面板提供「＋ 添加」按钮，点击后用官方默认值写入 layout。
+
+const addableUsdColors = computed<{ PropName: string; PropValues: string[]; type: number }[]>(() => {
+    const node = selectedLayoutNode.value
+    if (!node || node.kind !== "patch") return []
+    const def = layoutDefaults.value[nodeLabelKey(node)] ?? layoutDefaults.value[nodePaneName(node)]
+    const list = def?.UsdPatches
+    if (!Array.isArray(list)) return []
+    const existing = new Set<string>()
+    if (node.cwVals) existing.add("C_W")
+    if (node.radiusRef) existing.add("S_RoundRadius")
+    for (const c of node.usdColors) existing.add(c.name)
+    for (const n of node.usdNums) existing.add(n.name)
+    return list
+        .filter((u: { PropName?: unknown; PropValues?: unknown; type?: unknown }) =>
+            u && Array.isArray(u.PropValues) && (u.PropValues as string[]).length >= 4 && !existing.has(String(u.PropName)))
+        .map((u: { PropName?: unknown; PropValues?: unknown; type?: unknown }) => ({
+            PropName: String(u.PropName),
+            PropValues: u.PropValues as string[],
+            type: Number(u.type) || 1,
+        }))
+})
+
+// 添加默认颜色 UsdPatch 到 layout，然后重建节点并恢复选中
+const addUsdColor = (prop: { PropName: string; PropValues: string[]; type: number }) => {
+    const node = selectedLayoutNode.value
+    if (!node || node.kind !== "patch" || !layoutParsed.value) return
+    let arr = node.ref.UsdPatches as unknown[] | undefined
+    if (!Array.isArray(arr)) {
+        arr = []
+        ;(node.ref as Record<string, unknown>).UsdPatches = arr
+    }
+    if ((arr as { PropName?: unknown }[]).some((u) => u && u.PropName === prop.PropName)) return
+    ;(arr as unknown[]).push({ PropName: prop.PropName, PropValues: [...prop.PropValues], type: prop.type })
+    const oldId = node.id
+    const keepRef = node.ref
+    writeBackLayout()
+    const nodes = collectLayoutNodes(layoutParsed.value)
+    resolvePatchPositions(nodes)
+    layoutNodes.value = nodes
+    const idx = nodes.findIndex((n) => n.id === oldId && n.kind === "patch" && n.ref === keepRef)
+    selectedLayoutIndex.value = idx >= 0 ? idx : null
+}
+
+// 删除已添加的 UsdPatch（C_W / C_B 等），防止以默认值（如 0000）残留在 layout
+const removeUsdColor = (propName: string) => {
+    const node = selectedLayoutNode.value
+    if (!node || node.kind !== "patch" || !layoutParsed.value) return
+    const arr = node.ref.UsdPatches as unknown[] | undefined
+    if (!Array.isArray(arr)) return
+    ;(node.ref as Record<string, unknown>).UsdPatches = arr.filter(
+        (u) => !(u && typeof u === "object" && (u as { PropName?: unknown }).PropName === propName))
+    const oldId = node.id
+    const keepRef = node.ref
+    writeBackLayout()
+    const nodes = collectLayoutNodes(layoutParsed.value)
+    resolvePatchPositions(nodes)
+    layoutNodes.value = nodes
+    const idx = nodes.findIndex((n) => n.id === oldId && n.kind === "patch" && n.ref === keepRef)
+    selectedLayoutIndex.value = idx >= 0 ? idx : null
+}
 // 详情面板输入框显示值：Size（显示区域）的宽/高
 const patchSizeVal = (node: LayoutEntryNode, axis: "X" | "Y"): string | number => {
     const has = axis === "X" ? node.hasSizeX : node.hasSizeY
@@ -2303,12 +2867,37 @@ const setPatchSize = (node: LayoutEntryNode, axis: "X" | "Y", raw: string) => {
         node.sizeRef = {}
         node.ref.Size = node.sizeRef
     }
-    // 同步预览框形状
-    rebuildLayoutPreview()
+    // 同步预览框形状：sizeX/sizeY 是响应式的，修改后叠加层框会自动更新，无需整盘重建
     writeBackLayout()
 }
 
 // 详情面板输入：S_RoundRadius（圆角半径）
+// 显示区域 Size 整体为空时，提供"+"按钮，用初始值 X=0、Y=0 重新添加
+const addPatchSize = (node: LayoutEntryNode) => {
+    node.hasSizeX = true
+    node.hasSizeY = true
+    node.sizeX = 0
+    node.sizeY = 0
+    node.hasSize = true
+    if (!node.sizeRef) {
+        node.sizeRef = {}
+        node.ref.Size = node.sizeRef
+    }
+    node.sizeRef.X = node.sizeX
+    node.sizeRef.Y = node.sizeY
+    writeBackLayout()
+}
+
+// 是否支持显示区域（Size）：defaults.json 中该 Pane 有官方 Size 且非零才算支持。
+// 0×0 的占位/隐形 Pane 没有实际显示区域，不提供「＋ 添加显示区域」入口。
+const canAddSize = computed<boolean>(() => {
+    const node = selectedLayoutNode.value
+    if (!node || node.kind !== "patch") return false
+    const def = layoutDefaults.value[nodeLabelKey(node)] ?? layoutDefaults.value[nodePaneName(node)]
+    const sz = def?.Size
+    return !!sz && (Number(sz.X) !== 0 || Number(sz.Y) !== 0)
+})
+
 const setPatchRadius = (raw: string) => {
     const n = selectedLayoutNode.value
     if (!n || n.kind !== "patch") return
@@ -2347,7 +2936,7 @@ const patchVisibleState = computed({
 const writeBackLayout = () => {
     const node = selectedLayoutNode.value
     if (!node || layoutParsed.value == null) return
-    if (node.kind === "anim") return // 动画资源无坐标/可见性可写
+    if (node.kind === "anim" || node.kind === "entry") return // 动画/文件级数组条目无坐标可写
     if (node.kind === "patch") {
         if (node.hasX || node.hasY) {
             if (!node.posRef) {
@@ -2391,6 +2980,205 @@ const writeBackLayout = () => {
     }
     form.value.layoutJson = JSON.stringify(layoutParsed.value, null, 2)
     lastProgrammaticWrite = form.value.layoutJson
+}
+
+// —— 还原为官方默认 ——
+const resetStatus = ref("")
+let resetStatusTimer: ReturnType<typeof setTimeout> | null = null
+const showResetStatus = (msg: string, ok = true) => {
+    resetStatus.value = msg
+    clearTimeout(resetStatusTimer)
+    resetStatusTimer = setTimeout(() => { resetStatus.value = "" }, 4000)
+}
+
+// 点击「默认」：将元素的 Position / Scale / Size（显示区域）/ Visible / UsdPatches（颜色与数值属性）还原为官方 bflyt 默认值（保留元素）。
+// 官方默认值来自 defaults.json（20.x 固件数据），因此仅 20.X+ 布局显示该按钮。
+const resetPatchToDefault = () => {
+    const node = selectedLayoutNode.value
+    if (!node || node.kind !== "patch") return
+    const key = nodeLabelKey(node)
+    const def = layoutDefaults.value[key] ?? layoutDefaults.value[nodePaneName(node)]
+    if (!def) {
+        showResetStatus("未找到该元素的官方默认值，无法还原", false)
+        return
+    }
+    const fin = (v: unknown): v is number =>
+        typeof v === "number" && Number.isFinite(v) || typeof v === "string" && v.trim() !== "" && Number.isFinite(Number(v))
+    const num = (v: unknown): number => Number(v)
+
+    // Position
+    node.hasX = false
+    node.hasY = false
+    const pos = (def as any).Position
+    if (pos) {
+        if (fin(pos.X)) { node.hasX = true; node.x = num(pos.X) }
+        if (fin(pos.Y)) { node.hasY = true; node.y = num(pos.Y) }
+    }
+    node.hasPosition = node.hasX || node.hasY
+    // Scale
+    node.hasScaleX = false
+    node.hasScaleY = false
+    const sca = (def as any).Scale
+    if (sca) {
+        if (fin(sca.X)) { node.hasScaleX = true; node.sx = num(sca.X) }
+        if (fin(sca.Y)) { node.hasScaleY = true; node.sy = num(sca.Y) }
+    }
+    node.hasScale = node.hasScaleX || node.hasScaleY
+    // Size
+    node.hasSizeX = false
+    node.hasSizeY = false
+    const sz = (def as any).Size
+    if (sz) {
+        if (fin(sz.X)) { node.hasSizeX = true; node.sizeX = num(sz.X) }
+        if (fin(sz.Y)) { node.hasSizeY = true; node.sizeY = num(sz.Y) }
+    }
+    node.hasSize = node.hasSizeX || node.hasSizeY
+    // Visible
+    if (typeof def.Visible === "boolean") {
+        node.hasVisible = true
+        node.visible = def.Visible
+    } else {
+        node.hasVisible = false
+        node.visible = true
+    }
+
+    // UsdPatches（颜色与数值属性：C_W / C_B / S_BorderColor0 / S_RoundRadius / S_BorderSize 等）——
+    // 按官方默认整体替换，并重新解析到派生字段，供详情面板直接编辑
+    if (Array.isArray(def.UsdPatches)) {
+        node.ref.UsdPatches = JSON.parse(JSON.stringify(def.UsdPatches))
+        const u = node.ref.UsdPatches as unknown[]
+        let cwVals: string[] | null = null
+        let radiusVals: string[] | null = null
+        const usdColors: { name: string; vals: string[] }[] = []
+        const usdNums: { name: string; vals: string[] }[] = []
+        for (const patch of u) {
+            if (!patch || typeof patch !== "object") continue
+            const uo = patch as Record<string, unknown>
+            if (!Array.isArray(uo.PropValues)) continue
+            const upName = String(uo.PropName)
+            const upVals = uo.PropValues as string[]
+            if (upName === "C_W" && !cwVals) cwVals = upVals
+            else if (upName === "S_RoundRadius" && !radiusVals) radiusVals = upVals
+            else if (upVals.length >= 4) usdColors.push({ name: upName, vals: upVals })
+            else usdNums.push({ name: upName, vals: upVals })
+        }
+        node.cwVals = cwVals
+        node.hasCw = !!cwVals && cwVals.length >= 4
+        if (node.hasCw) {
+            node.cwR = Number(cwVals[0]) || 0
+            node.cwG = Number(cwVals[1]) || 0
+            node.cwB = Number(cwVals[2]) || 0
+            node.cwA = Number(cwVals[3]) || 0
+        } else {
+            node.cwR = node.cwG = node.cwB = node.cwA = 0
+        }
+        node.radiusRef = radiusVals
+        node.hasRadius = !!radiusVals && radiusVals.length >= 1
+        node.radius = node.hasRadius ? Number(radiusVals[0]) || 0 : 0
+        node.usdColors = usdColors
+        node.usdNums = usdNums
+    } else {
+        delete node.ref.UsdPatches
+        node.cwVals = null
+        node.hasCw = false
+        node.cwR = node.cwG = node.cwB = node.cwA = 0
+        node.radiusRef = null
+        node.hasRadius = false
+        node.radius = 0
+        node.usdColors = []
+        node.usdNums = []
+    }
+
+    // 直接把默认值写入 JSON（Position / Scale / Size 结构、Visible 字段）
+    if (node.hasPosition) {
+        if (!node.posRef) { node.posRef = {}; node.ref.Position = node.posRef }
+        if (node.hasX) node.posRef.X = node.x; else delete node.posRef.X
+        if (node.hasY) node.posRef.Y = node.y; else delete node.posRef.Y
+    } else { delete node.ref.Position; node.posRef = null }
+    if (node.hasScale) {
+        if (!node.scaleRef) { node.scaleRef = {}; node.ref.Scale = node.scaleRef }
+        if (node.hasScaleX) node.scaleRef.X = node.sx; else delete node.scaleRef.X
+        if (node.hasScaleY) node.scaleRef.Y = node.sy; else delete node.scaleRef.Y
+    } else { delete node.ref.Scale; node.scaleRef = null }
+    if (node.hasSize) {
+        if (!node.sizeRef) { node.sizeRef = {}; node.ref.Size = node.sizeRef }
+        if (node.hasSizeX) node.sizeRef.X = node.sizeX; else delete node.sizeRef.X
+        if (node.hasSizeY) node.sizeRef.Y = node.sizeY; else delete node.sizeRef.Y
+    } else { delete node.ref.Size; node.sizeRef = null }
+    if (node.hasVisible) node.ref[node.visibleKey] = node.visible
+    else delete node.ref[node.visibleKey]
+
+    form.value.layoutJson = JSON.stringify(layoutParsed.value, null, 2)
+    lastProgrammaticWrite = form.value.layoutJson
+    showResetStatus("✓ 已还原为官方默认设置")
+}
+// —— 文件级数组条目（AddGroups / RemoveGroups / Materials）的 JSON 编辑 ——
+const entryDraft = ref("")
+const entryDraftChanged = ref(false)
+// 选中 entry 时把原始 JSON 载入编辑框
+watch(selectedLayoutNode, (n) => {
+    if (n && n.kind === "entry") {
+        entryDraft.value = JSON.stringify(n.ref, null, 2)
+        entryDraftChanged.value = false
+    }
+})
+const applyEntryEdit = () => {
+    const node = selectedLayoutNode.value
+    if (!node || node.kind !== "entry") return
+    const root = layoutParsed.value as { Files?: unknown[] } | null
+    if (!root || !Array.isArray(root.Files)) {
+        showResetStatus("未找到 Files 数组", false)
+        return
+    }
+    // 按 FileName 定位文件（不依赖 fileIdx，更稳健）
+    const file = root.Files.find((f): f is Record<string, unknown> =>
+        !!f && typeof f === "object" && (f as Record<string, unknown>).FileName === node.fileName)
+    if (!file) {
+        showResetStatus("找不到对应文件", false)
+        return
+    }
+    const arr = file[node.entryKey!]
+    if (!Array.isArray(arr)) {
+        showResetStatus("找不到该类型数组", false)
+        return
+    }
+    if (node.entryIdx! >= arr.length) {
+        showResetStatus("元素下标越界", false)
+        return
+    }
+    // 清空编辑框 = 移出该条目（数组缩容，如 -> "Materials": []）
+    if (entryDraft.value.trim() === "") {
+        arr.splice(node.entryIdx!, 1)
+        form.value.layoutJson = JSON.stringify(root, null, 2)
+        lastProgrammaticWrite = form.value.layoutJson
+        entryDraftChanged.value = false
+        showResetStatus("✓ 已移除该条目")
+        rebuildLayoutPreview()
+        return
+    }
+    let parsed: unknown
+    try {
+        parsed = JSON.parse(entryDraft.value)
+    } catch {
+        showResetStatus("JSON 格式错误，无法应用", false)
+        return
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        showResetStatus("条目必须是 JSON 对象", false)
+        return
+    }
+    arr[node.entryIdx!] = parsed
+    // 同步当前节点引用与显示名（保留选中，避免元素消失）
+    node.ref = parsed
+    const nameKey = node.entryKind === "Materials" ? "MaterialName" : "GroupName"
+    const nm = (parsed as Record<string, unknown>)[nameKey]
+    const base = (node.id ?? "").split(" · ")[0]
+    node.id = typeof nm === "string" ? (base ? `${base} · ${nm}` : nm) : node.id
+    form.value.layoutJson = JSON.stringify(root, null, 2)
+    lastProgrammaticWrite = form.value.layoutJson
+    entryDraftChanged.value = false
+    showResetStatus("✓ 已应用")
+    // 不再 rebuildLayoutPreview，避免重建列表/清空选中导致条目消失
 }
 </script>
 
@@ -2497,7 +3285,7 @@ const writeBackLayout = () => {
             </section>
 
             <section class="mb-4 grid items-stretch gap-3 lg:grid-cols-[minmax(0,1.7fr)_auto_minmax(320px,1fr)]">
-                <article class="grid gap-3 rounded-2xl border border-slate-800 bg-slate-900/90 p-4 shadow-xl">
+                <article class="relative grid gap-3 rounded-2xl border border-slate-800 bg-slate-900/90 p-4 shadow-xl">
                     <h2 class="flex items-center justify-between gap-3 text-lg font-semibold">
                         <span>背景</span>
                         <div v-if="backgroundAssetKey" class="flex shrink-0 flex-wrap items-center gap-2">
@@ -2534,34 +3322,52 @@ const writeBackLayout = () => {
                                 <span class="text-xs font-medium text-slate-300">拖拽背景图到此处，或点击上传</span>
                                 <span class="text-[10px] text-slate-500">支持 JPG、PNG</span>
                             </div>
-                            <div v-if="previewUrls[backgroundAssetKey] && layoutNodes.length && layoutOverlayOn && bgImgRect" class="pointer-events-none absolute z-10" :style="bgImgRectStyle">
-                                <template v-for="(node, i) in layoutNodes" :key="i">
+                            <div v-if="previewUrls[backgroundAssetKey] && focusedSizeNode && bgImgRect" class="pointer-events-none absolute z-10" :style="bgImgRectStyle">
                                     <div
-                                        v-if="node.kind === 'box' || (node.hasPosition && node.hasX && node.hasY)"
-                                        :class="layoutOverlayClasses(node, i)"
-                                        :style="node.kind === 'box' ? layoutBoxStyle(node) : layoutPatchBoxStyle(node)"
-                                        :title="node.id"
-                                        @click.stop="onOverlaySelect(i)"
+                                        class="relative rounded-md border border-amber-400/80 bg-amber-400/20 shadow-[0_0_0_1px_rgba(251,191,36,0.4),0_0_12px_rgba(251,191,36,0.25)]"
+                                        :style="layoutPatchBoxStyle(focusedSizeNode)"
                                     >
                                         <img
-                                            v-if="layoutIconUrl(node)"
-                                            :src="layoutIconUrl(node)"
-                                            :alt="node.id"
+                                            v-if="layoutIconUrl(focusedSizeNode)"
+                                            :src="layoutIconUrl(focusedSizeNode)"
+                                            :alt="focusedSizeNode.id"
                                             class="pointer-events-none h-full w-full rounded-md object-contain"
                                             draggable="false"
                                         />
-                                        <span class="absolute left-0 top-0 max-w-full truncate bg-black/60 px-1 text-[8px] leading-3 text-sky-100">{{ layoutShortName(node) }}</span>
+                                        <span class="absolute left-0 top-0 max-w-full truncate bg-black/60 px-1 text-[8px] leading-3 text-amber-100">{{ layoutShortName(focusedSizeNode) }}</span>
                                     </div>
-                                </template>
-                            </div>
+                                </div>
                         </div>
                         <p class="text-xs text-slate-400">{{ bgInfoLine }}</p>
-                        <div v-if="layoutParsed && layoutOverlayOn" class="grid gap-2 rounded-xl border border-slate-800 bg-slate-950/40 p-3">
-                            <div class="flex items-center justify-between gap-2">
-                                <span class="text-xs font-semibold text-slate-200">布局元素（{{ layoutNodes.length }}）</span>
-                                <span class="text-[10px] text-slate-500">点击行选中，预览区同步高亮</span>
+                        <div v-if="layoutParsed && layoutOverlayOn" class="flex flex-col gap-2 rounded-xl border border-slate-800 bg-slate-950/40 p-3" :class="layoutElementsExpanded ? 'absolute left-0 right-0 z-20 overflow-hidden border-slate-700' : ''" :style="layoutElementsExpanded ? layoutExpandStyle : ''">
+                            <div class="flex shrink-0 items-center justify-between gap-2">
+                                <span class="flex min-w-0 items-center gap-2">
+                                    <span class="text-xs font-semibold text-slate-200">布局元素（{{ layoutNodes.length }}）</span>
+                                    <button
+                                        v-if="layoutParsed && fwBadge"
+                                        type="button"
+                                        :disabled="layoutFwState === 'fw20'"
+                                        :title="fwBadge.title"
+                                        class="shrink-0 rounded-full border px-2 py-0.5 text-[10px] font-semibold transition-colors"
+                                        :class="fwBadge.cls"
+                                        @click="cycleLayoutFirmware"
+                                    >
+                                        {{ fwBadge.text }}
+                                    </button>
+                                </span>
+                                <span class="flex shrink-0 items-center gap-2">
+                                    <span class="text-[10px] text-slate-500">点击行选中，预览区同步高亮</span>
+                                    <button
+                                        type="button"
+                                        :title="layoutElementsExpanded ? '收起，还原高度' : '放大，扩展到预览图片区域'"
+                                        class="shrink-0 rounded p-0.5 text-slate-500 transition-colors hover:text-primary-300"
+                                        @click="layoutElementsExpanded = !layoutElementsExpanded"
+                                    >
+                                        <span :class="layoutElementsExpanded ? 'i-lucide-minimize text-[12px] block' : 'i-lucide-maximize text-[12px] block'" />
+                                    </button>
+                                </span>
                             </div>
-                            <div class="flex items-center gap-2">
+                            <div class="flex shrink-0 items-center gap-2">
                                 <input
                                     v-model="layoutSearch"
                                     type="text"
@@ -2573,7 +3379,12 @@ const writeBackLayout = () => {
                                     仅显示有位置
                                 </label>
                             </div>
-                            <div class="max-h-44 overflow-y-auto rounded-lg border border-slate-800">
+                            <div v-if="missingFw20Elements.length" class="flex shrink-0 items-center justify-between gap-2 rounded-lg border border-amber-500/50 bg-amber-500/10 px-2 py-1.5">
+                                <span class="text-[10px] text-amber-200">主菜单缺少 20.x 新元素：{{ missingFw20Elements.join("、") }}</span>
+                                <button type="button" class="shrink-0 rounded-md border border-amber-500/60 px-2 py-0.5 text-[10px] text-amber-200 transition-colors hover:bg-amber-500/20" @click="fillFw20Defaults">补充默认值</button>
+                            </div>
+                            <p v-if="fwFillToast" class="shrink-0 rounded-lg border border-emerald-800/50 bg-emerald-950/30 px-2 py-1 text-[10px] text-emerald-300">{{ fwFillToast }}</p>
+                            <div :class="layoutElementsExpanded ? 'min-h-0 flex-1 overflow-y-auto' : 'max-h-44 overflow-y-auto'" class="rounded-lg border border-slate-800">
                                 <div class="flex items-center gap-2 border-b border-slate-800 bg-slate-900/60 px-2 py-1 text-[9px] uppercase tracking-wide text-slate-500">
                                     <span class="w-40 shrink-0">文件</span>
                                     <span class="min-w-0 flex-1">元素</span>
@@ -2585,43 +3396,68 @@ const writeBackLayout = () => {
                                     :key="item.index"
                                     :id="`layout-row-${item.index}`"
                                     class="flex cursor-pointer items-center gap-2 border-b border-slate-800/60 px-2 py-1 text-[10px] transition-colors last:border-b-0"
-                                    :class="item.index === selectedLayoutIndex ? 'bg-primary-400/20 text-primary-200' : 'text-slate-300 hover:bg-slate-800/40'"
+                                    :class="[
+                                        item.index === selectedLayoutIndex
+                                            ? 'bg-primary-400/20 text-primary-200'
+                                            : 'text-slate-300 hover:bg-slate-800/40',
+                                        isFw19Legacy(item.node)
+                                            ? (item.index === selectedLayoutIndex ? 'bg-rose-500/15 text-rose-100' : 'bg-rose-500/10 text-rose-200 hover:bg-rose-500/15')
+                                            : '',
+                                        isMigratedNewFw20(item.node)
+                                            ? (item.index === selectedLayoutIndex ? 'bg-sky-500/25 text-sky-100' : 'bg-sky-500/20 text-sky-200 hover:bg-sky-500/25')
+                                            : '',
+                                    ]"
                                     @click="onSelectLayoutNode(item.index, item.node)"
                                 >
-                                    <span class="w-40 shrink-0 truncate text-slate-500">{{ item.node.kind === 'patch' || item.node.kind === 'anim' ? (item.node.fileName || '—') : '—' }}</span>
+                                    <span class="w-40 shrink-0 truncate text-slate-500">{{ item.node.kind === 'patch' || item.node.kind === 'anim' || item.node.kind === 'entry' ? (item.node.fileName || '—') : '—' }}</span>
                                     <span class="min-w-0 flex-1 truncate">
                                         <template v-if="item.node.kind === 'patch'">{{ item.node.id.split(' · ')[1] ?? item.node.id }}<span v-if="paneDisplayLabel(item.node)" class="text-slate-500">（{{ paneDisplayLabel(item.node) }}）</span></template>
                                         <template v-else-if="item.node.kind === 'anim'"><span class="text-violet-300">{{ item.node.id }}</span></template>
+                                        <template v-else-if="item.node.kind === 'entry'"><span class="text-cyan-300">{{ item.node.id }}</span> <span class="rounded bg-cyan-500/15 px-1 text-[8px] text-cyan-400">{{ item.node.entryKind }}</span></template>
                                         <template v-else>{{ item.node.id }}<span v-if="paneDisplayLabel(item.node)" class="text-slate-500">（{{ paneDisplayLabel(item.node) }}）</span></template>
                                     </span>
+                                    <span v-if="isFw19Legacy(item.node)" title="19.x 旧元素：该 Pane 在 20.0 固件布局中位置/大小/可见性已改变，此处修改在 20.x 上可能错位" class="shrink-0 rounded bg-rose-500/25 px-1 text-[8px] font-bold text-rose-300">19</span>
+                                    <span v-if="isMigratedNewFw20(item.node)" title="本次迁移新增的 20.x 元素（自动补充的默认值，仅本次会话高亮）" class="shrink-0 rounded bg-sky-500/30 px-1 text-[8px] font-bold text-sky-200">20</span>
                                     <button v-if="pendingDeleteId === item.node.id" type="button" class="shrink-0 rounded p-0.5 text-red-400 transition-colors hover:text-red-300" title="再点一次确认删除（从布局 JSON 移除该元素）" @click.stop="requestDeleteNode(item.node)">
                                         <span class="i-lucide-check text-[9px] block" />
                                     </button>
                                     <button v-else type="button" class="shrink-0 rounded p-0.5 text-slate-600 transition-colors hover:text-red-400" title="删除该元素（从布局 JSON 移除）" @click.stop="requestDeleteNode(item.node)">
                                         <span class="i-lucide-trash-2 text-[9px] block" />
                                     </button>
-                                    <button v-if="item.node.kind !== 'anim'" type="button" class="shrink-0 rounded p-0.5 text-slate-600 transition-colors hover:text-slate-300" title="标注中文名" @click.stop="annotatePane(item.node)">
+                                    <button v-if="item.node.kind !== 'anim' && item.node.kind !== 'entry'" type="button" class="shrink-0 rounded p-0.5 text-slate-600 transition-colors hover:text-slate-300" title="标注中文名" @click.stop="annotatePane(item.node)">
                                         <span class="i-lucide-tag text-[9px] block" />
                                     </button>
                                     <span v-else class="w-4 shrink-0" />
                                     <span class="w-20 shrink-0 text-right font-mono text-slate-400" :title="item.node.kind === 'patch' && item.node.hasPosition && (!item.node.hasX || !item.node.hasY) ? '? = 该轴未设置，安装时按 0 处理（如 X=-300、Y=0，可能移出屏幕）' : ''">{{ item.node.kind === 'patch' ? patchPosShort(item.node) : (item.node.hasPosition ? `${Math.round(item.node.x)}, ${Math.round(item.node.y)}` : '—') }}</span>
                                     <span class="flex w-8 shrink-0 justify-center">
-                                        <input v-if="item.node.kind !== 'anim'" v-model="item.node.visible" type="checkbox" class="accent-primary-500" @click.stop @change="writeBackLayout" />
+                                        <input v-if="item.node.kind !== 'anim' && item.node.kind !== 'entry'" v-model="item.node.visible" type="checkbox" class="accent-primary-500" @click.stop @change="writeBackLayout" />
                                         <span v-else class="text-slate-600">—</span>
                                     </span>
                                 </div>
                                 <p v-if="!filteredLayoutNodes.length" class="px-2 py-2 text-[10px] text-slate-500">没有匹配的元素</p>
                             </div>
-                            <div v-if="selectedLayoutNode" class="grid gap-2 border-t border-slate-800 pt-2">
-                                <div class="flex items-center justify-between gap-2">
+                            <div v-if="selectedLayoutNode" class="flex shrink-0 flex-col gap-2 border-t border-slate-800 pt-2" :class="layoutElementsExpanded ? 'min-h-0 flex-1 overflow-y-auto' : ''">
+                                <div class="flex shrink-0 items-center justify-between gap-2">
                                     <strong class="truncate text-xs text-slate-100">{{ selectedLayoutNode.id }}</strong>
-                                    <label v-if="selectedLayoutNode.kind === 'box'" class="flex items-center gap-1.5 text-xs text-slate-300">
-                                        <input v-model="selectedLayoutNode.visible" type="checkbox" class="accent-primary-500" @change="writeBackLayout" />
-                                        显示此元素
-                                    </label>
+                                    <div class="flex shrink-0 items-center gap-1.5">
+                                        <button v-if="selectedLayoutNode.kind === 'patch' && layoutFwState === 'fw20'" type="button" title="将此元素还原为官方（系统原版 bflyt）默认设置（仅 20.X+ 布局，官方默认值来自 defaults.json）" class="rounded-md border border-slate-700 px-1.5 py-0.5 text-[10px] text-slate-300 transition-colors hover:border-emerald-500/70 hover:text-emerald-300" @click="resetPatchToDefault">默认</button>
+                                        <label v-if="selectedLayoutNode.kind === 'box'" class="flex items-center gap-1.5 text-xs text-slate-300">
+                                            <input v-model="selectedLayoutNode.visible" type="checkbox" class="accent-primary-500" @change="writeBackLayout" />
+                                            显示此元素
+                                        </label>
+                                    </div>
                                 </div>
+                                <p v-if="resetStatus" class="text-[10px]" :class="resetStatus.startsWith('✓') ? 'text-emerald-300' : 'text-amber-300'">{{ resetStatus }}</p>
                                 <p v-if="selectedLayoutNode.kind === 'anim'" class="text-[10px] text-slate-500">动画资源（bflan）：随主题打包，无坐标/尺寸，无法叠加定位。</p>
-                                <div v-if="selectedLayoutNode.kind === 'box'" class="grid grid-cols-4 gap-2">
+                                <div v-else-if="selectedLayoutNode.kind === 'entry'" :class="layoutElementsExpanded ? 'flex min-h-0 flex-1 flex-col gap-1.5' : 'grid gap-1.5'">
+                                    <div class="flex shrink-0 items-center justify-between gap-2">
+                                        <span class="text-[10px] text-slate-400">类型：{{ selectedLayoutNode.entryKind }}</span>
+                                        <button type="button" class="rounded-md border border-slate-700 px-2 py-0.5 text-xs text-slate-300 transition-colors hover:border-emerald-500/70 hover:text-emerald-300 disabled:opacity-40" :disabled="!entryDraftChanged" @click="applyEntryEdit">应用</button>
+                                    </div>
+                                    <textarea v-model="entryDraft" rows="6" spellcheck="false" :class="layoutElementsExpanded ? 'min-h-0 flex-1 resize-none' : ''" class="w-full rounded-md border border-slate-700 bg-slate-950/60 px-1.5 py-1 font-mono text-[10px] leading-snug text-slate-100 outline-none placeholder-slate-600 focus:border-primary-500/60" @input="entryDraftChanged = true"></textarea>
+                                    <p class="shrink-0 text-[10px] text-slate-500">以 JSON 编辑该条目（AddGroups / RemoveGroups / Materials），改完点「应用」写回布局。</p>
+                                </div>
+                                <div v-if="selectedLayoutNode.kind === 'box'" class="grid shrink-0 grid-cols-4 gap-2">
                                     <label class="grid gap-1 text-[10px] text-slate-400">X
                                         <input v-model.number="selectedLayoutNode.x" type="number" class="w-full rounded-md border border-slate-700 bg-slate-950/60 px-1.5 py-1 text-xs text-slate-100 outline-none focus:border-primary-500/60" @input="writeBackLayout" />
                                     </label>
@@ -2635,44 +3471,94 @@ const writeBackLayout = () => {
                                         <input v-model.number="selectedLayoutNode.height" type="number" class="w-full rounded-md border border-slate-700 bg-slate-950/60 px-1.5 py-1 text-xs text-slate-100 outline-none focus:border-primary-500/60" @input="writeBackLayout" />
                                     </label>
                                 </div>
-                                <div v-else-if="selectedLayoutNode.kind === 'patch'" class="grid grid-cols-5 gap-2">
-                                        <label class="grid gap-1 text-[10px] text-slate-400">坐标 X
+                                <div v-else-if="selectedLayoutNode.kind === 'patch'" class="grid shrink-0 grid-cols-5 gap-2">
+                                        <label class="grid gap-1 text-[10px] text-slate-400">
+                                            <span class="flex w-full items-center gap-1"><span>坐标 X</span><span class="text-slate-600">Position</span></span>
                                             <input :value="patchAxisVal(selectedLayoutNode, 'X')" type="number" placeholder="未设置" class="w-full rounded-md border border-slate-700 bg-slate-950/60 px-1.5 py-1 text-xs text-slate-100 outline-none placeholder-slate-600 focus:border-primary-500/60" @input="setPatchAxis(selectedLayoutNode, 'X', ($event.target as HTMLInputElement).value)" />
                                         </label>
-                                        <label class="grid gap-1 text-[10px] text-slate-400">坐标 Y
+                                        <label class="grid gap-1 text-[10px] text-slate-400">
+                                            <span class="flex w-full items-center gap-1"><span>坐标 Y</span><span class="text-slate-600">Position</span></span>
                                             <input :value="patchAxisVal(selectedLayoutNode, 'Y')" type="number" placeholder="未设置" class="w-full rounded-md border border-slate-700 bg-slate-950/60 px-1.5 py-1 text-xs text-slate-100 outline-none placeholder-slate-600 focus:border-primary-500/60" @input="setPatchAxis(selectedLayoutNode, 'Y', ($event.target as HTMLInputElement).value)" />
                                         </label>
-                                        <label class="grid gap-1 text-[10px] text-slate-400">缩放 X
+                                        <label class="grid gap-1 text-[10px] text-slate-400">
+                                            <span class="flex w-full items-center gap-1"><span>缩放 X</span><span class="text-slate-600">Scale</span></span>
                                             <input :value="patchScaleVal(selectedLayoutNode, 'X')" type="number" placeholder="未设置" step="0.01" class="w-full rounded-md border border-slate-700 bg-slate-950/60 px-1.5 py-1 text-xs text-slate-100 outline-none placeholder-slate-600 focus:border-primary-500/60" @input="setPatchScale(selectedLayoutNode, 'X', ($event.target as HTMLInputElement).value)" />
                                         </label>
-                                        <label class="grid gap-1 text-[10px] text-slate-400">缩放 Y
+                                        <label class="grid gap-1 text-[10px] text-slate-400">
+                                            <span class="flex w-full items-center gap-1"><span>缩放 Y</span><span class="text-slate-600">Scale</span></span>
                                             <input :value="patchScaleVal(selectedLayoutNode, 'Y')" type="number" placeholder="未设置" step="0.01" class="w-full rounded-md border border-slate-700 bg-slate-950/60 px-1.5 py-1 text-xs text-slate-100 outline-none placeholder-slate-600 focus:border-primary-500/60" @input="setPatchScale(selectedLayoutNode, 'Y', ($event.target as HTMLInputElement).value)" />
                                         </label>
                                     <div class="grid gap-1 text-[10px] text-slate-300">
-                                        <span>Visible（布尔值）</span>
+                                        <span class="flex w-full items-center gap-1"><span>状态</span><span class="text-slate-600">Visible</span></span>
                                         <select v-model="patchVisibleState" class="w-full rounded-md border border-slate-700 bg-slate-950/60 px-1.5 py-1 text-xs text-slate-100 outline-none focus:border-primary-500/60">
-                                            <option value="true">true · 显示</option>
-                                            <option value="false">false · 隐藏</option>
-                                            <option value="none">无该字段（不写入）</option>
+                                            <option value="true">显示</option>
+                                            <option value="false">隐藏</option>
+                                            <option value="none">未设置</option>
                                         </select>
                                     </div>
                                 </div>
-                                <div v-if="selectedLayoutNode.kind === 'patch' && selectedLayoutNode.hasSize" class="grid grid-cols-2 gap-2 border-t border-slate-800 pt-2">
-                                    <label class="grid gap-1 text-[10px] text-slate-400">显示区域 宽（X）
-                                        <input :value="patchSizeVal(selectedLayoutNode, 'X')" type="number" placeholder="未设置" class="w-full rounded-md border border-slate-700 bg-slate-950/60 px-1.5 py-1 text-xs text-slate-100 outline-none placeholder-slate-600 focus:border-primary-500/60" @input="setPatchSize(selectedLayoutNode, 'X', ($event.target as HTMLInputElement).value)" />
-                                    </label>
-                                    <label class="grid gap-1 text-[10px] text-slate-400">显示区域 高（Y）
-                                        <input :value="patchSizeVal(selectedLayoutNode, 'Y')" type="number" placeholder="未设置" class="w-full rounded-md border border-slate-700 bg-slate-950/60 px-1.5 py-1 text-xs text-slate-100 outline-none placeholder-slate-600 focus:border-primary-500/60" @input="setPatchSize(selectedLayoutNode, 'Y', ($event.target as HTMLInputElement).value)" />
-                                    </label>
+                                <div v-if="selectedLayoutNode.kind === 'patch' && (canAddSize || selectedLayoutNode.hasSize)" class="shrink-0 border-t border-slate-800 pt-2">
+                                    <div class="flex items-center justify-between gap-2">
+                                        <span class="text-[10px] text-slate-400">显示区域</span>
+                                        <button v-if="!selectedLayoutNode.hasSize" type="button" title="添加显示区域（X=0，Y=0）" class="rounded-md border border-slate-700 px-2 py-0.5 text-xs text-slate-300 transition-colors hover:border-primary-500 hover:text-primary-300" @click="addPatchSize(selectedLayoutNode)">＋</button>
+                                    </div>
+                                    <div v-if="selectedLayoutNode.kind === 'patch' && selectedLayoutNode.hasSize" class="mt-1 grid shrink-0 grid-cols-2 gap-2">
+                                        <label class="grid gap-1 text-[10px] text-slate-400">
+                                            <span class="flex w-full items-center gap-1"><span>宽（X）</span><span class="text-slate-600">Size</span></span>
+                                            <input :value="patchSizeVal(selectedLayoutNode, 'X')" type="number" placeholder="未设置" class="w-full rounded-md border border-slate-700 bg-slate-950/60 px-1.5 py-1 text-xs text-slate-100 outline-none placeholder-slate-600 focus:border-primary-500/60" @input="setPatchSize(selectedLayoutNode, 'X', ($event.target as HTMLInputElement).value)" />
+                                        </label>
+                                        <label class="grid gap-1 text-[10px] text-slate-400">
+                                            <span class="flex w-full items-center gap-1"><span>高（Y）</span><span class="text-slate-600">Size</span></span>
+                                            <input :value="patchSizeVal(selectedLayoutNode, 'Y')" type="number" placeholder="未设置" class="w-full rounded-md border border-slate-700 bg-slate-950/60 px-1.5 py-1 text-xs text-slate-100 outline-none placeholder-slate-600 focus:border-primary-500/60" @input="setPatchSize(selectedLayoutNode, 'Y', ($event.target as HTMLInputElement).value)" />
+                                        </label>
+                                    </div>
                                 </div>
-                                <div v-if="selectedLayoutNode.kind === 'patch' && selectedLayoutNode.hasRadius" class="grid grid-cols-2 gap-2 border-t border-slate-800 pt-2">
+                                <div v-if="selectedLayoutNode.kind === 'patch' && selectedLayoutNode.hasRadius" class="grid shrink-0 grid-cols-2 gap-2 border-t border-slate-800 pt-2">
                                     <label class="grid gap-1 text-[10px] text-slate-400">圆角半径
                                         <input :value="selectedLayoutNode.radius" type="number" min="0" placeholder="0" class="w-full rounded-md border border-slate-700 bg-slate-950/60 px-1.5 py-1 text-xs text-slate-100 outline-none placeholder-slate-600 focus:border-primary-500/60" @input="setPatchRadius(($event.target as HTMLInputElement).value)" />
                                     </label>
                                 </div>
-                                <div v-if="selectedLayoutNode.kind === 'patch' && selectedLayoutNode.hasCw" class="grid gap-2 border-t border-slate-800 pt-2">
+                                <!-- C_W 与 C_B 同时存在时，在同一容器左右各占一半显示 -->
+                                <div v-if="selectedLayoutNode.kind === 'patch' && selectedLayoutNode.hasCw && cbColor" class="grid shrink-0 grid-cols-2 gap-2 border-t border-slate-800 pt-2">
+                                    <div class="grid gap-1 rounded-md border border-slate-800/60 bg-slate-950/30 p-1.5">
+                                        <div class="flex items-center justify-between gap-2">
+                                            <span class="flex items-center gap-1">
+                                                <button type="button" title="删除 C_W（从 layout 移除该属性）" class="shrink-0 rounded-md border border-slate-700 px-1 py-0.5 text-[10px] leading-none text-slate-400 transition-colors hover:border-rose-500/70 hover:text-rose-300" @click="removeUsdColor('C_W')">－</button>
+                                                <span class="text-[10px] font-semibold text-slate-300">颜色 C_W</span>
+                                            </span>
+                                            <span class="font-mono text-[10px] text-slate-500">{{ cwDisplay }}</span>
+                                        </div>
+                                        <div class="flex items-center gap-1.5">
+                                            <input :value="cwColorHex" type="color" class="h-7 w-10 shrink-0 cursor-pointer rounded border border-slate-700 bg-transparent p-0" @input="setCwColorHex(($event.target as HTMLInputElement).value)" />
+                                            <label class="flex min-w-0 flex-1 items-center gap-1.5 text-[10px] text-slate-400">
+                                                <span class="shrink-0">透明度</span>
+                                                <input v-model.number="selectedLayoutNode.cwA" type="range" min="0" max="255" class="min-w-0 flex-1 accent-primary-500" @input="writeBackCw" />
+                                            </label>
+                                        </div>
+                                    </div>
+                                    <div class="grid gap-1 rounded-md border border-slate-800/60 bg-slate-950/30 p-1.5">
+                                        <div class="flex items-center justify-between gap-2">
+                                            <span class="flex items-center gap-1">
+                                                <button type="button" title="删除 C_B（从 layout 移除该属性）" class="shrink-0 rounded-md border border-slate-700 px-1 py-0.5 text-[10px] leading-none text-slate-400 transition-colors hover:border-rose-500/70 hover:text-rose-300" @click="removeUsdColor('C_B')">－</button>
+                                                <span class="text-[10px] font-semibold text-slate-300">颜色 C_B</span>
+                                            </span>
+                                            <span class="font-mono text-[10px] text-slate-500">{{ usdColorDisplay(cbColor) }}</span>
+                                        </div>
+                                        <div class="flex items-center gap-1.5">
+                                            <input :value="usdColorHex(cbColor)" type="color" class="h-7 w-10 shrink-0 cursor-pointer rounded border border-slate-700 bg-transparent p-0" @input="setUsdColorHex(cbColor, ($event.target as HTMLInputElement).value)" />
+                                            <label class="flex min-w-0 flex-1 items-center gap-1.5 text-[10px] text-slate-400">
+                                                <span class="shrink-0">透明度</span>
+                                                <input :value="usdAlpha(cbColor)" type="range" min="0" max="255" class="min-w-0 flex-1 accent-primary-500" @input="setUsdColorAlpha(cbColor, Number(($event.target as HTMLInputElement).value))" />
+                                            </label>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div v-if="selectedLayoutNode.kind === 'patch' && selectedLayoutNode.hasCw && !cbColor" class="grid shrink-0 gap-2 border-t border-slate-800 pt-2">
                                     <div class="flex items-center justify-between gap-2">
-                                        <span class="text-[10px] font-semibold text-slate-300">颜色 C_W（RGBA）</span>
+                                        <span class="flex items-center gap-1">
+                                            <button type="button" title="删除 C_W（从 layout 移除该属性）" class="shrink-0 rounded-md border border-slate-700 px-1 py-0.5 text-[10px] leading-none text-slate-400 transition-colors hover:border-rose-500/70 hover:text-rose-300" @click="removeUsdColor('C_W')">－</button>
+                                            <span class="text-[10px] font-semibold text-slate-300">颜色 C_W</span>
+                                        </span>
                                         <span class="font-mono text-[10px] text-slate-500">{{ cwDisplay }}</span>
                                     </div>
                                     <div class="flex items-center gap-2">
@@ -2690,11 +3576,80 @@ const writeBackLayout = () => {
                                         </label>
                                     </div>
                                 </div>
+                                <!-- 仅存在 C_B（无 C_W）时单独显示 -->
+                                <div v-if="selectedLayoutNode.kind === 'patch' && !selectedLayoutNode.hasCw && cbColor" class="grid shrink-0 gap-2 border-t border-slate-800 pt-2">
+                                    <div class="flex items-center justify-between gap-2">
+                                        <span class="flex items-center gap-1">
+                                            <button type="button" title="删除 C_B（从 layout 移除该属性）" class="shrink-0 rounded-md border border-slate-700 px-1 py-0.5 text-[10px] leading-none text-slate-400 transition-colors hover:border-rose-500/70 hover:text-rose-300" @click="removeUsdColor('C_B')">－</button>
+                                            <span class="text-[10px] font-semibold text-slate-300">颜色 C_B</span>
+                                        </span>
+                                        <span class="font-mono text-[10px] text-slate-500">{{ usdColorDisplay(cbColor) }}</span>
+                                    </div>
+                                    <div class="flex items-center gap-2">
+                                        <input :value="usdColorHex(cbColor)" type="color" class="h-7 w-10 shrink-0 cursor-pointer rounded border border-slate-700 bg-transparent p-0" @input="setUsdColorHex(cbColor, ($event.target as HTMLInputElement).value)" />
+                                        <label class="min-w-0 flex-1 grid gap-1 text-[10px] text-slate-400">透明度
+                                            <input :value="usdAlpha(cbColor)" type="range" min="0" max="255" class="w-full accent-primary-500" @input="setUsdColorAlpha(cbColor, Number(($event.target as HTMLInputElement).value))" />
+                                        </label>
+                                        <label class="grid gap-1 text-[10px] text-slate-400">透明度值
+                                            <input :value="usdAlpha(cbColor)" type="number" min="0" max="255" class="w-16 rounded-md border border-slate-700 bg-slate-950/60 px-1.5 py-1 text-xs text-slate-100 outline-none focus:border-primary-500/60" @input="setUsdColorAlpha(cbColor, Number(($event.target as HTMLInputElement).value))" />
+                                        </label>
+                                    </div>
+                                </div>
+                                <div v-if="selectedLayoutNode.kind === 'patch' && (otherUsdColors.length || usdNums.length)" class="grid shrink-0 gap-2 border-t border-slate-800 pt-2">
+                                    <template v-if="otherUsdColors.length">
+                                        <div class="flex items-center justify-between gap-2">
+                                            <span class="text-[10px] font-semibold text-slate-300">其它颜色</span>
+                                            <span class="font-mono text-[10px] text-slate-500">{{ otherUsdColors.length }} 项</span>
+                                        </div>
+                                        <div v-for="c in otherUsdColors" :key="c.name" class="grid gap-1 rounded-md border border-slate-800/60 bg-slate-950/30 p-1.5">
+                                            <div class="flex items-center gap-2">
+                                                <span class="w-16 shrink-0 truncate text-[10px] text-slate-400" :title="c.name">{{ c.name }}</span>
+                                                <input
+                                                    :value="usdColorHex(c)"
+                                                    type="color"
+                                                    class="h-7 w-10 shrink-0 cursor-pointer rounded border border-slate-700 bg-transparent p-0"
+                                                    @input="setUsdColorHex(c, ($event.target as HTMLInputElement).value)"
+                                                />
+                                                <span class="min-w-0 flex-1 truncate font-mono text-[10px] text-slate-500">{{ usdColorDisplay(c) }}</span>
+                                            </div>
+                                            <div class="flex items-center gap-2">
+                                                <label class="min-w-0 flex-1 grid gap-1 text-[10px] text-slate-400">透明度
+                                                    <input :value="usdAlpha(c)" type="range" min="0" max="255" class="w-full accent-primary-500" @input="setUsdColorAlpha(c, Number(($event.target as HTMLInputElement).value))" />
+                                                </label>
+                                                <label class="grid gap-1 text-[10px] text-slate-400">值
+                                                    <input :value="usdAlpha(c)" type="number" min="0" max="255" class="w-16 rounded-md border border-slate-700 bg-slate-950/60 px-1.5 py-1 text-xs text-slate-100 outline-none focus:border-primary-500/60" @input="setUsdColorAlpha(c, Number(($event.target as HTMLInputElement).value))" />
+                                                </label>
+                                            </div>
+                                        </div>
+                                    </template>
+                                    <template v-if="usdNums.length">
+                                        <span class="text-[10px] font-semibold text-slate-300">窗格样式 / 属性（数值）</span>
+                                        <div class="grid grid-cols-2 gap-2">
+                                            <label v-for="n in usdNums" :key="n.name" class="grid gap-1 text-[10px] text-slate-400">
+                                                <span class="truncate" :title="n.name">{{ n.name }}</span>
+                                                <input type="number" step="any" class="w-full rounded-md border border-slate-700 bg-slate-950/60 px-1.5 py-1 text-xs text-slate-100 outline-none focus:border-primary-500/60" :value="n.vals[0]" @input="setUsdNum(n, ($event.target as HTMLInputElement).value)" />
+                                            </label>
+                                        </div>
+                                    </template>
+                                </div>
+                                <div v-if="selectedLayoutNode.kind === 'patch' && addableUsdColors.length" class="flex flex-wrap items-center gap-1.5 border-t border-slate-800 pt-2">
+                                    <span class="text-[10px] font-semibold text-slate-300">添加默认颜色</span>
+                                    <button
+                                        v-for="c in addableUsdColors"
+                                        :key="c.PropName"
+                                        type="button"
+                                        :title="`添加材质颜色 ${c.PropName}（官方默认 ${c.PropValues.join(', ')}）`"
+                                        class="rounded-md border border-slate-700 px-2 py-0.5 text-[10px] text-slate-300 transition-colors hover:border-primary-500 hover:text-primary-300"
+                                        @click="addUsdColor(c)"
+                                    >
+                                        ＋ {{ c.PropName }}
+                                    </button>
+                                </div>
                                 <p v-if="selectedLayoutNode.kind === 'patch' && selectedLayoutNode.visible !== false && !selectedLayoutNode.hasPosition" class="text-[10px] text-slate-500">该补丁原本没有 Position，设置 X/Y 后将新建。</p>
                                 <label v-if="selectedLayoutNode.kind === 'box'" class="grid gap-1 text-[10px] text-slate-400">层级（z-index）
                                     <input v-model.number="selectedLayoutNode.zIndex" type="number" class="w-full rounded-md border border-slate-700 bg-slate-950/60 px-1.5 py-1 text-xs text-slate-100 outline-none focus:border-primary-500/60" @input="writeBackLayout" />
                                 </label>
-                                <div v-if="annotateName" class="grid gap-1.5 border-t border-slate-800 pt-2">
+                                <div v-if="annotateName" class="grid shrink-0 gap-1.5 border-t border-slate-800 pt-2">
                                     <span class="text-[10px] font-semibold text-slate-300">标注「{{ annotateDisplay }}」（留空 = 清除）</span>
                                     <div class="flex items-center gap-1.5">
                                         <input v-model="annotateText" type="text" placeholder="中文名称，如：游戏图标的排列位置和缩放" class="min-w-0 flex-1 rounded-md border border-slate-700 bg-slate-950/60 px-1.5 py-1 text-xs text-slate-100 outline-none placeholder-slate-600 focus:border-primary-500/60" @keydown.enter="savePaneLabel" @keydown.esc="annotateName = null" />
@@ -2793,7 +3748,11 @@ const writeBackLayout = () => {
                                 @click="methodPanelOpen = !methodPanelOpen"
                             >
                                 <span class="font-semibold">方法</span>
-                                <span class="text-[10px] text-slate-500">{{ layoutMethods.length ? `已存 ${layoutMethods.length} 个` : '把复杂布局提取成可复用的积木' }}</span>
+                                <span class="min-w-0 flex-1 truncate text-right text-[10px] text-slate-500">{{ layoutMethods.length ? `已存 ${layoutMethods.length} 个` : '把复杂布局提取成可复用的积木' }}</span>
+                                <span
+                                    class="i-lucide-chevron-right shrink-0 text-[10px] transition-transform duration-200"
+                                    :class="methodPanelOpen ? 'rotate-90 text-slate-300' : 'text-slate-500'"
+                                />
                             </button>
                             <div class="flex shrink-0 items-center gap-1.5 pr-2">
                                 <button type="button" class="rounded-md border border-slate-700 px-2 py-1 text-[10px] text-slate-300 transition-colors hover:border-slate-500 hover:text-slate-100" @click="methodImportInput?.click()">导入</button>
@@ -2802,7 +3761,7 @@ const writeBackLayout = () => {
                             </div>
                         </div>
                         <div v-if="methodPanelOpen" class="grid gap-2 border-t border-slate-800 p-3">
-                        <p v-if="methodSaveToast" class="rounded-lg border border-emerald-800/50 bg-emerald-950/30 px-2 py-1 text-[10px] text-emerald-300">{{ methodSaveToast }}</p>
+                        <p v-if="methodSaveToast" class="rounded-lg border px-2 py-1 text-[10px]" :class="methodToastError ? 'border-red-800/50 bg-red-950/30 text-red-300' : 'border-emerald-800/50 bg-emerald-950/30 text-emerald-300'">{{ methodSaveToast }}</p>
                         <button
                                 v-if="layoutParsed"
                                 type="button"
@@ -2847,6 +3806,7 @@ const writeBackLayout = () => {
                                 <div v-for="(m, i) in layoutMethods" :key="m.savedAt + '-' + i" class="grid gap-1.5 rounded-lg border border-slate-800 bg-slate-900/60 px-2 py-1.5">
                                     <div class="flex items-center gap-2">
                                         <span class="min-w-0 flex-1 truncate text-xs text-slate-200" :title="m.name">{{ m.name }}</span>
+                                        <span class="shrink-0 rounded-full border px-1.5 py-px text-[9px] font-semibold" :class="METHOD_FW_BADGE[detectMethodFirmware(m)].cls" :title="METHOD_FW_BADGE[detectMethodFirmware(m)].title">{{ METHOD_FW_BADGE[detectMethodFirmware(m)].text }}</span>
                                         <span class="shrink-0 rounded border border-slate-700 px-1 py-px text-[9px] text-slate-500">{{ new Date(m.savedAt).toLocaleDateString() }}</span>
                                         <button type="button" class="shrink-0 rounded-md border px-1.5 py-0.5 text-[10px] transition-colors" :class="methodDetailIndex === i ? 'border-sky-400 bg-sky-400/20 text-sky-200' : 'border-slate-700 text-sky-300 hover:border-sky-500/60 hover:text-sky-200'" @click="toggleMethodDetail(i)">应用</button>
                                         <button type="button" class="shrink-0 rounded-md p-1 text-slate-500 transition-colors hover:text-slate-200" title="导出此方法（单独 .json）" @click="exportMethod(m)"><span class="i-lucide-download text-[10px] block" /></button>
@@ -2863,6 +3823,8 @@ const writeBackLayout = () => {
                                         <span class="text-[10px] font-semibold text-slate-300">应用冲突预览（对当前布局）：</span>
                                         <p v-if="!layoutParsed" class="text-[10px] text-slate-500">尚未导入布局：应用后将用方法内容<b class="text-sky-300">创建为新布局</b>。</p>
                                         <template v-else>
+                                            <p v-if="methodFwCompat(m).reason && methodFwCompat(m).ok" class="rounded-md border border-amber-800/50 bg-amber-950/30 px-2 py-1 text-[10px] text-amber-300">ℹ {{ methodFwCompat(m).reason }}</p>
+                                            <p v-if="!methodFwCompat(m).ok" class="rounded-md border border-red-800/50 bg-red-950/30 px-2 py-1 text-[10px] text-red-300">⚠ {{ methodFwCompat(m).reason }}</p>
                                             <p v-if="!methodConflictInfo(m).files.length && !methodConflictInfo(m).anims.length" class="text-[10px] text-slate-500">此方法为空，或当前布局格式不匹配（数组格式）。</p>
                                             <div v-for="f in methodConflictInfo(m).files" :key="f.file" class="flex items-center gap-1.5 text-[10px]">
                                                 <span class="w-10 shrink-0 font-medium" :class="f.status === 'new' ? 'text-emerald-300' : 'text-orange-300'">{{ f.status === 'new' ? '新增' : '覆盖' }}</span>
@@ -2873,7 +3835,7 @@ const writeBackLayout = () => {
                                                 <span class="min-w-0 flex-1 truncate font-mono text-violet-300">{{ a.file }}</span>
                                             </div>
                                         </template>
-                                        <button type="button" class="mt-0.5 rounded-md bg-sky-500/20 px-2 py-1 text-[10px] text-sky-200 transition-colors hover:bg-sky-500/30" @click="applyMethod(m)">确认应用</button>
+                                        <button type="button" class="mt-0.5 rounded-md px-2 py-1 text-[10px] transition-colors" :disabled="!methodFwCompat(m).ok" :class="methodFwCompat(m).ok ? 'bg-sky-500/20 text-sky-200 hover:bg-sky-500/30' : 'cursor-not-allowed bg-slate-800/60 text-slate-500'" @click="applyMethod(m)">确认应用</button>
                                     </div>
                                 </div>
                             </div>
@@ -2889,7 +3851,7 @@ const writeBackLayout = () => {
                                     ref="layoutTextareaRef"
                                     v-model="form.layoutJson"
                                     class="h-full w-full rounded-xl border border-slate-800 bg-slate-950/40 p-3 text-xs font-mono text-slate-300 placeholder-slate-600 focus:border-primary-500/50 focus:ring-1 focus:ring-primary-500/50 transition-all duration-200 outline-none resize-none"
-                                    placeholder="在此粘贴布局 JSON。设置后背景图变为可选。"
+                                    placeholder="在此粘贴layout JSON。可选。"
                                 />
                                 <button
                                     v-if="form.layoutJson.trim()"
@@ -2919,7 +3881,7 @@ const writeBackLayout = () => {
                                 <textarea
                                     v-model="form.commonJson"
                                     class="h-full w-full rounded-xl border border-slate-800 bg-slate-950/40 p-3 text-xs font-mono text-slate-300 placeholder-slate-600 focus:border-primary-500/50 focus:ring-1 focus:ring-primary-500/50 transition-all duration-200 outline-none resize-none"
-                                    placeholder="在此粘贴 common JSON。可选，非必要。"
+                                    placeholder="在此粘贴 common JSON。可选。"
                                 />
                                 <button
                                     v-if="form.commonJson.trim()"
@@ -3143,6 +4105,35 @@ const writeBackLayout = () => {
             </div>
         </div>
         <n-toaster />
+        <!-- 固件档位迁移确认弹窗：仅用户点「确认迁移」后才真正执行迁移 -->
+        <div v-if="fwMigrateConfirm" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" @click.self="fwMigrateConfirm = null">
+            <div class="w-full max-w-sm rounded-xl border border-slate-700 bg-slate-900 p-4 shadow-2xl">
+                <h3 class="text-sm font-semibold text-slate-100">迁移固件档位</h3>
+                <pre class="mt-2 whitespace-pre-wrap text-[11px] leading-relaxed text-slate-300">{{ fwMigrateConfirm.msg }}</pre>
+                <!-- 待删除的不兼容元素表格：放在提示最后面 -->
+                <div v-if="fwMigrateConfirm.removed.length" class="mt-3">
+                    <p class="text-[11px] font-medium text-slate-400">本次迁移将删除的不兼容元素</p>
+                    <table class="mt-1 w-full border-separate border-spacing-0 overflow-hidden rounded-lg border border-rose-500/30 text-[11px]">
+                        <thead>
+                            <tr class="bg-rose-500/10 text-rose-300">
+                                <th class="border-b border-rose-500/30 px-2 py-1 text-left font-semibold">类型</th>
+                                <th class="border-b border-rose-500/30 px-2 py-1 text-left font-semibold">文件</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr v-for="n in fwMigrateConfirm.removed" :key="n" class="text-slate-300">
+                                <td class="border-b border-slate-800 px-2 py-1 text-rose-300">{{ n.endsWith('.bflan') ? '动画' : n.endsWith('.bflyt') ? '布局' : '文件' }}</td>
+                                <td class="border-b border-slate-800 px-2 py-1 font-mono">{{ n }}</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div class="mt-4 flex justify-end gap-2">
+                    <button type="button" class="rounded-md px-3 py-1.5 text-xs text-slate-400 transition-colors hover:text-slate-200" @click="fwMigrateConfirm = null">取消</button>
+                    <button type="button" class="rounded-md bg-primary-500/20 px-3 py-1.5 text-xs text-primary-200 transition-colors hover:bg-primary-500/30" @click="confirmMigrateFirmware">确认迁移</button>
+                </div>
+            </div>
+        </div>
     </main>
 </template>
 

@@ -76,10 +76,8 @@ export const useNxthemeImport = () => {
         target: infoTarget,
         layoutJson: parsed.layoutJson || "",
         commonJson: parsed.commonJson || "",
-        assets: {
-          ...currentForm.assets,
-          ...assets,
-        },
+        // 资源（图标等）以本次导入的包为准：直接替换，不继承上一份导入的残留资源
+        assets,
       },
       warning,
     }

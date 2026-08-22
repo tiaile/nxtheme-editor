@@ -104,6 +104,17 @@ if (existsSync(labelsFile)) {
     )
 }
 
+// 7.6) 内联官方默认值数据 applets/dll/defaults.json（「默认」按钮用于还原官方设置）。
+//      同样注入 <script type="application/json">，使 file:// 双击打开也能离线使用。
+const defaultsFile = join(outDir, "applets", "dll", "defaults.json")
+if (existsSync(defaultsFile)) {
+    const defaultsJson = readFileSync(defaultsFile, "utf8")
+        .replace(/<\/script/gi, "<\\/script")
+    html = html.replace("</head>", () =>
+        `<script type="application/json" id="defaults-data">${defaultsJson}</script>\n</head>`,
+    )
+}
+
 // 写出
 mkdirSync(outDir, { recursive: true })
 writeFileSync(join(outDir, "index.html"), html)
