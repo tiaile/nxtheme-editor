@@ -24,15 +24,16 @@ jobs:
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: canary
+          # 固定稳定版本，避免 canary 每日变动导致构建不稳定
+          bun-version: 1.2.9
 
       - name: Restore Bun cache
         uses: actions/cache@v6
         with:
           path: ~/.bun/install/cache
-          key: ${{ runner.os }}-${{ runner.arch }}-bun-canary-${{ hashFiles('bun.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-bun-1.2.9-${{ hashFiles('bun.lock') }}
           restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-bun-canary-
+            ${{ runner.os }}-${{ runner.arch }}-bun-1.2.9-
 
       - name: Install dependencies
         # 仓库未提交 bun.lock，--frozen-lockfile 会因找不到锁文件而失败，故不加该标志
