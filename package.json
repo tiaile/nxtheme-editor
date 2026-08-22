@@ -8,11 +8,9 @@
     "url": "https://github.com/tiaile/nxtheme-editor.git"
   },
   "scripts": {
-    "build": "nuxt build",
-    "build:generate": "nuxt generate",
+    "build:offline": "cross-env NODE_DISABLE_COMPILE_CACHE=1 node scripts/build-offline.mjs",
     "start": "nuxt preview",
     "start:dev": "nuxt dev",
-    "build:offline": "cross-env NODE_DISABLE_COMPILE_CACHE=1 node scripts/build-offline.mjs",
     "postinstall": "nuxt prepare",
     "smoke": "bun ./scripts/smoke.mjs"
   },
